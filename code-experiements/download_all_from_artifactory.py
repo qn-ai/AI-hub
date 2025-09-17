@@ -1,93 +1,153 @@
+#!/usr/bin/env python3
+"""
+Download/copy a Hugging Face model via an Artifactory mirror into local cache,
+then copy the snapshot into a project's working directory.
+
+Behavior:
+1) If the model snapshot is already present in the local HF cache, skip the network download.
+2) Otherwise, download from the HF endpoint (e.g., Artifactory mirror) into local cache.
+3) Copy the cached snapshot into the working directory (e.g., ./models/<safe_model_id>).
+
+Environment:
+- HF_ENDPOINT  (e.g., https://<your-artifactory>/api/huggingface)
+- HF_TOKEN     (required if your mirror requires auth)
+- HF_HOME      (optional; to control cache root)
+- HUGGINGFACE_HUB_CACHE (optional; another way to control cache)
+
+Usage:
+  python scripts/download_model.py --model-id meta-llama/Llama-3-8b --workdir models
+
+Requires:
+  pip install huggingface_hub>=0.25
+"""
+
+import argparse
 import os
-import requests
-from urllib.parse import urljoin
+import shutil
+from pathlib import Path
+from typing import Optional
 
-def list_artifactory_files(base_url, repo_path, api_key=None):
-    """
-    List all files in an Artifactory folder using the REST API.
-    Returns a list of file URLs.
-    """
-    api_url = urljoin(base_url, f"api/storage/{repo_path}")
-    headers = {}
-    if api_key:
-        headers["X-JFrog-Art-Api"] = api_key
+from huggingface_hub import snapshot_download
+from huggingface_hub.utils import LocalEntryNotFoundError
 
-    response = requests.get(api_url, headers=headers)
-    response.raise_for_status()
-    data = response.json()
-    files = []
-    for child in data.get("children", []):
-        if not child["folder"]:
-            file_url = urljoin(base_url, f"{repo_path}/{child['uri'].lstrip('/')}")
-            files.append(file_url)
-    return files
 
-def download_file(url, dest_folder, api_key=None):
-    """
-    Download a single file from Artifactory.
-    """
-    if not os.path.exists(dest_folder):
-        os.makedirs(dest_folder)
-    filename = os.path.basename(url)
-    dest_path = os.path.join(dest_folder, filename)
-    headers = {}
-    if api_key:
-        headers["X-JFrog-Art-Api"] = api_key
+def safe_model_dir_name(model_id: str) -> str:
+    # Matches HF cache dir naming style; good for project dirs too
+    return model_id.replace("/", "--").replace(":", "_")
 
-    with requests.get(url, stream=True, headers=headers) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-    print(f"Downloaded {filename} to {dest_path}")
 
-def download_all_files_from_artifactory(base_url, repo_path, dest_folder, api_key=None):
-    """
-    Download all files from an Artifactory folder.
-    """
-    file_urls = list_artifactory_files(base_url, repo_path, api_key)
-    for url in file_urls:
-        download_file(url, dest_folder, api_key)
+def copy_snapshot_to_workdir(snapshot_path: Path, workdir: Path) -> Path:
+    workdir.mkdir(parents=True, exist_ok=True)
+    target = workdir / safe_model_dir_name(snapshot_path.name if snapshot_path.name.startswith("models--") else snapshot_path.name)
+    # If snapshot_path is ".../models--<safe>", prefer that <safe> for target name
+    if snapshot_path.name.startswith("models--"):
+        target = workdir / snapshot_path.name.replace("models--", "", 1)
 
-if __name__ == "__main__":
-    # Example usage:
-    base_url = input("Artifactory base URL (e.g. https://artifactory.mycompany.com/artifactory/): ").strip()
-    repo_path = input("Repository path (e.g. my-repo/models/my-model/1.0.0): ").strip()
-    dest_folder = input("Local destination folder (default '.'): ").strip() or "."
-    api_key = input("API key (leave blank if not needed): ").strip() or None
+    # Safer: ensure target is the safe model dir name derived from the model id present in path
+    # but keep stable naming:
+    target = workdir / safe_model_dir_name(target.name)
 
-    download_all_files_from_artifactory(base_url, repo_path, dest_folder, api_key)
+    # Copy snapshot contents
+    target.mkdir(parents=True, exist_ok=True)
+    # Copytree with dirs_exist_ok=True mirrors rsync-like behavior
+    for item in snapshot_path.iterdir():
+        dest = target / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dest)
+    return target
+
+
+def get_cache_dir() -> Path:
+    # Respect HF cache env vars if set; otherwise fallback to default
+    # huggingface_hub uses HF_HOME or HUGGINGFACE_HUB_CACHE.
+    # We don't need to replicate all logic; this is just for informative printing.
+    env_cache = os.getenv("HUGGINGFACE_HUB_CACHE") or (
+        (Path(os.getenv("HF_HOME")).expanduser() / "hub").as_posix() if os.getenv("HF_HOME") else None
+    )
+    if env_cache:
+        return Path(env_cache).expanduser()
+    # Default huggingface_hub cache location
+    return Path("~/.cache/huggingface/hub").expanduser()
+
+
+def resolve_snapshot(
+    model_id: str,
+    revision: Optional[str],
+    cache_dir: Optional[Path],
+    allow_network: bool,
+    token: Optional[str],
+) -> Path:
+    """Return the snapshot path in cache. If allow_network=False, raises if not cached."""
+    snapshot_path = Path(
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_files_only=not allow_network,
+            token=token,
+            cache_dir=str(cache_dir) if cache_dir else None,
+        )
+    )
+    return snapshot_path
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download HuggingFace models with stable directory structure.")
-    parser.add_argument("--repo", type=str, required=True, help="HuggingFace repo ID or local path")
-    parser.add_argument("--dst", type=str, required=True, help="Destination directory for the model")
-    parser.add_argument("--local", action="store_true", help="Use only local cache, no network")
-    parser.add_argument("--endpoint", type=str, default=None, help="Custom HuggingFace endpoint")
-    parser.add_argument("--token", type=str, default=None, help="Access token for HuggingFace")
-    parser.add_argument("--etag_timeout", type=int, default=86400, help="Timeout for etag validation")
-    parser.add_argument("--download_timeout", type=int, default=86400, help="Timeout for downloads")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-id", required=True, help="Hugging Face model repo id (e.g., 'bert-base-uncased')")
+    parser.add_argument("--revision", default=None, help="Optional revision/commit/tag")
+    parser.add_argument("--workdir", default="models", help="Project working directory to copy the model into")
+    parser.add_argument("--cache-dir", default=None, help="Optional explicit cache dir (overrides env defaults)")
+    parser.add_argument("--force-refresh", action="store_true", help="Force network download even if cached")
     args = parser.parse_args()
 
-    # Configure environment
-    configure_hf_env(
-        endpoint=args.endpoint,
-        token=args.token,
-        etag_timeout=args.etag_timeout,
-        download_timeout=args.download_timeout,
-    )
+    hf_endpoint = os.getenv("HF_ENDPOINT")  # e.g., Artifactory HF proxy URL
+    hf_token = os.getenv("HF_TOKEN")
+    # huggingface_hub honors HF_ENDPOINT automatically via env var if set.
 
-    # Download model
-    final_dir = download_model_to_dir(
-        repo_id_or_path=args.repo,
-        dst_dir=Path(args.dst),
-        local_files_only=args.local,
-    )
+    if hf_endpoint:
+        print(f"[info] Using HF endpoint: {hf_endpoint}")
+    if hf_token:
+        print("[info] HF token provided via env")
 
-    print(f"Model downloaded to: {final_dir}")
+    cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
+    if cache_dir:
+        print(f"[info] Using explicit cache dir: {cache_dir}")
+    else:
+        print(f"[info] Using cache dir (effective): {get_cache_dir()}")
+
+    # Step 1: try to resolve from cache only (skip network) unless force-refresh
+    snapshot_path = None
+    if not args.force_refresh:
+        try:
+            print("[info] Checking local cache for snapshot...")
+            snapshot_path = resolve_snapshot(
+                model_id=args.model_id,
+                revision=args.revision,
+                cache_dir=cache_dir,
+                allow_network=False,
+                token=hf_token,
+            )
+            print(f"[ok] Found in cache: {snapshot_path}")
+        except LocalEntryNotFoundError:
+            print("[info] Not found in cache.")
+
+    # Step 2: if not cached (or force-refresh), download (this will populate cache)
+    if snapshot_path is None:
+        print("[info] Downloading model into cache...")
+        snapshot_path = resolve_snapshot(
+            model_id=args.model_id,
+            revision=args.revision,
+            cache_dir=cache_dir,
+            allow_network=True,
+            token=hf_token,
+        )
+        print(f"[ok] Downloaded snapshot: {snapshot_path}")
+
+    # Step 3: copy snapshot contents into working directory
+    workdir = Path(args.workdir).expanduser()
+    dest = copy_snapshot_to_workdir(Path(snapshot_path), workdir)
+    print(f"[done] Copied snapshot to working dir: {dest.resolve()}")
 
 
 if __name__ == "__main__":
