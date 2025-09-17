@@ -58,3 +58,37 @@ if __name__ == "__main__":
     api_key = input("API key (leave blank if not needed): ").strip() or None
 
     download_all_files_from_artifactory(base_url, repo_path, dest_folder, api_key)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Download HuggingFace models with stable directory structure.")
+    parser.add_argument("--repo", type=str, required=True, help="HuggingFace repo ID or local path")
+    parser.add_argument("--dst", type=str, required=True, help="Destination directory for the model")
+    parser.add_argument("--local", action="store_true", help="Use only local cache, no network")
+    parser.add_argument("--endpoint", type=str, default=None, help="Custom HuggingFace endpoint")
+    parser.add_argument("--token", type=str, default=None, help="Access token for HuggingFace")
+    parser.add_argument("--etag_timeout", type=int, default=86400, help="Timeout for etag validation")
+    parser.add_argument("--download_timeout", type=int, default=86400, help="Timeout for downloads")
+
+    args = parser.parse_args()
+
+    # Configure environment
+    configure_hf_env(
+        endpoint=args.endpoint,
+        token=args.token,
+        etag_timeout=args.etag_timeout,
+        download_timeout=args.download_timeout,
+    )
+
+    # Download model
+    final_dir = download_model_to_dir(
+        repo_id_or_path=args.repo,
+        dst_dir=Path(args.dst),
+        local_files_only=args.local,
+    )
+
+    print(f"Model downloaded to: {final_dir}")
+
+
+if __name__ == "__main__":
+    main()
