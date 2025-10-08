@@ -1,298 +1,267 @@
 # app.py
-# Streamlit Knowledge Graph Explorer for survey data
-# pip install streamlit pandas networkx pyvis pandas
-import re
+# Streamlit Knowledge Graph (multi-label domains/subdomains)
+
 import pandas as pd
 import networkx as nx
 import streamlit as st
 from pyvis.network import Network
-# ----------------------------
-# Streamlit Page Config
-# ----------------------------
-st.set_page_config(page_title="Knowledge Graph Explorer", layout="wide")
-st.title("📊🔗 Knowledge Graph Explorer")
-st.caption("Upload your CSV → map columns → build a knowledge graph → query & visualize")
-# ----------------------------
-# Sidebar: Upload & Config
-# ----------------------------
-st.sidebar.header("1) Upload CSV")
-uploaded = st.sidebar.file_uploader("Choose a CSV file", type=["csv"])
-st.sidebar.header("2) Column Mapping")
-# Helpful notes
-with st.expander("CSV expectations & tips (click to open)"):
-    st.markdown("""
-- **Required**: A column for *Participant ID*.  
-- **Optional**: *Assessor ID*, *Review ID*.  
-- **Questions**: All other columns are treated as question columns **unless** you map them as labels.  
-- **Labels**: You can specify **Domain** and **Subdomain** label columns (supports multi-label like `A;B;C`).  
-- For multi-label separators, use `;`, `|`, or `,`.
-""")
-# Defaults (you can adjust after upload)
-participant_col = None
-assessor_col = None
-review_col = None
-domain_cols = []
-subdomain_cols = []
-multilabel_seps = [";", "|", ","]
+from sklearn.preprocessing import OneHotEncoder
+
+st.set_page_config(page_title="Multi-Label Knowledge Graph", layout="wide")
+st.title("🔗 Knowledge Graph — Participants ↔ Domains/Subdomains")
+
+# ---------- Upload ----------
+uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+st.sidebar.caption("Tip: Domain/Subdomain columns may contain multi-labels like: 'Health; Education | Safety'.")
+
+def split_multi(val, seps):
+    if pd.isna(val): return []
+    s = str(val).strip()
+    if not s: return []
+    # split by the first matching separator present
+    for sp in seps:
+        if sp in s:
+            return [p.strip() for p in s.split(sp) if p.strip()]
+    return [s]
+
 if uploaded is not None:
-    # Load once
     df = pd.read_csv(uploaded)
-    # Basic sanitation: make all column names strings
     df.columns = [str(c) for c in df.columns]
-    all_cols = list(df.columns)
-    st.success(f"Loaded CSV with **{df.shape[0]} rows** & **{df.shape[1]} columns**")
-    # Sidebar selectors
-    participant_col = st.sidebar.selectbox("Participant ID column", options=all_cols, index=0)
-    review_col = st.sidebar.selectbox("Review ID column (optional)", options=["(none)"] + all_cols, index=0)
-    assessor_col = st.sidebar.selectbox("Assessor ID column (optional)", options=["(none)"] + all_cols, index=0)
-    domain_cols = st.sidebar.multiselect("Domain label column(s) (optional)", options=all_cols, default=[])
-    subdomain_cols = st.sidebar.multiselect("Subdomain label column(s) (optional)", options=all_cols, default=[])
-    sep_choice = st.sidebar.multiselect("Multi-label separators", multilabel_seps, default=multilabel_seps)
-    st.sidebar.header("3) Answer Value Nodes")
-    enable_value_nodes = st.sidebar.checkbox(
-        "Create value nodes for low-cardinality answers (Yes/No, Likert, etc.)",
-        value=True
-    )
-    value_cardinality_threshold = st.sidebar.slider(
-        "Max unique answers to consider 'low cardinality'",
-        min_value=3, max_value=30, value=12
-    )
-    # Determine question columns (everything not mapped)
-    non_question = set([participant_col])
-    if review_col != "(none)": non_question.add(review_col)
-    if assessor_col != "(none)": non_question.add(assessor_col)
-    non_question.update(domain_cols)
-    non_question.update(subdomain_cols)
-    question_cols = [c for c in all_cols if c not in non_question]
-    with st.expander("Detected columns"):
-        st.write("**Participant:**", participant_col)
-        st.write("**Review:**", None if review_col == "(none)" else review_col)
-        st.write("**Assessor:**", None if assessor_col == "(none)" else assessor_col)
-        st.write("**Domain labels:**", domain_cols if domain_cols else "(none)")
-        st.write("**Subdomain labels:**", subdomain_cols if subdomain_cols else "(none)")
-        st.write(f"**Question columns ({len(question_cols)}):**", question_cols[:30] + (["..."] if len(question_cols) > 30 else []))
-    # ----------------------------
-    # Helpers
-    # ----------------------------
-    def split_multilabel(val):
-        if pd.isna(val):
-            return []
-        s = str(val).strip()
-        if not s:
-            return []
-        separators = [sep for sep in sep_choice if sep]
-        if separators:
-            pattern = "|".join(map(re.escape, separators))
-            parts = re.split(pattern, s)
-            return [p.strip() for p in parts if p.strip()]
-        return [s]
-    @st.cache_data(show_spinner=False)
-    def compute_low_cardinality(df_in: pd.DataFrame, qcols, thresh: int):
-        low = set()
-        for c in qcols:
-            uniq = df_in[c].dropna().astype(str).nunique()
-            if 0 < uniq <= thresh:
-                low.add(c)
-        return low
-    low_card_qs = compute_low_cardinality(df, question_cols, value_cardinality_threshold) if enable_value_nodes else set()
-    # ----------------------------
-    # Build Graph
-    # ----------------------------
-    build_graph = st.sidebar.button("4) Build Knowledge Graph")
-    if build_graph:
+
+    st.success(f"Loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+
+    # ---------- Mapping ----------
+    st.sidebar.header("Column Mapping")
+    cols = list(df.columns)
+
+    participant_col = st.sidebar.selectbox("Participant ID", options=cols)
+    review_col = st.sidebar.selectbox("Review ID (optional)", options=["(none)"] + cols, index=0)
+    assessor_col = st.sidebar.selectbox("Assessor ID (optional)", options=["(none)"] + cols, index=0)
+
+    domain_cols = st.sidebar.multiselect("Domain label column(s)", options=cols)
+    subdomain_cols = st.sidebar.multiselect("Subdomain label column(s)", options=cols)
+
+    # remaining columns become “answer” columns (57 answers)
+    reserved = set([participant_col])
+    if review_col != "(none)": reserved.add(review_col)
+    if assessor_col != "(none)": reserved.add(assessor_col)
+    reserved.update(domain_cols)
+    reserved.update(subdomain_cols)
+    answer_cols = [c for c in cols if c not in reserved]
+
+    st.sidebar.header("Multi-label separators")
+    seps = st.sidebar.multiselect("Choose all separators used", [";", "|", ","], default=[";", "|", ","])
+
+    with st.expander("Detected columns", expanded=False):
+        st.write("**Domains:**", domain_cols or "(none)")
+        st.write("**Subdomains:**", subdomain_cols or "(none)")
+        st.write(f"**Answer columns ({len(answer_cols)}):**", answer_cols[:25] + (["..."] if len(answer_cols) > 25 else []))
+
+    # ---------- Build Graph ----------
+    if st.sidebar.button("Build Knowledge Graph"):
         G = nx.Graph()
-        # Pre-add label nodes cache (so reused)
-        def ensure_label_node(label_text: str, label_type: str):
-            nid = f"{label_type}:{label_text}"
+
+        # helper to add (once) label nodes
+        def ensure_label_node(label: str, ltype: str):
+            nid = f"{ltype}:{label}"
             if not G.has_node(nid):
-                G.add_node(nid, type=label_type, label=label_text)
+                G.add_node(nid, type=ltype, label=label)
             return nid
-        # Iterate rows
+
         for _, row in df.iterrows():
             pid = str(row[participant_col]).strip()
             pnode = f"participant:{pid}"
             if not G.has_node(pnode):
                 meta = {}
-                if assessor_col != "(none)": meta["assessor"] = row[assessor_col]
-                if review_col != "(none)": meta["review"] = row[review_col]
+                if review_col != "(none)": meta["review_id"] = row[review_col]
+                if assessor_col != "(none)": meta["assessor_id"] = row[assessor_col]
                 G.add_node(pnode, type="participant", **meta)
-            # Domains / Subdomains
+
+            # domains
             dnodes = []
             for dcol in domain_cols:
-                for lab in split_multilabel(row[dcol]):
+                for lab in split_multi(row[dcol], seps):
+                    if not lab: continue
                     dnode = ensure_label_node(lab, "domain")
                     dnodes.append(dnode)
-                    G.add_edge(pnode, dnode, rel="has_domain")
+                    G.add_edge(pnode, dnode, rel="in_domain")
+
+            # subdomains
             sdnodes = []
             for sdcol in subdomain_cols:
-                for lab in split_multilabel(row[sdcol]):
+                for lab in split_multi(row[sdcol], seps):
+                    if not lab: continue
                     sdnode = ensure_label_node(lab, "subdomain")
                     sdnodes.append(sdnode)
-                    G.add_edge(pnode, sdnode, rel="has_subdomain")
-            # Optional domain-subdomain hierarchy edges
+                    G.add_edge(pnode, sdnode, rel="in_subdomain")
+
+            # optional hierarchy (domain—subdomain)
             for dn in dnodes:
                 for sdn in sdnodes:
                     if not G.has_edge(dn, sdn):
                         G.add_edge(dn, sdn, rel="hierarchy")
-            # Questions & Answers
-            for q in question_cols:
-                qnode = f"question:{q}"
-                if not G.has_node(qnode):
-                    G.add_node(qnode, type="question", label=q)
-                ans_raw = row[q]
-                ans = None if pd.isna(ans_raw) else str(ans_raw)
-                G.add_edge(pnode, qnode, rel="answered", answer=ans)
-                if enable_value_nodes and q in low_card_qs and ans not in (None, ""):
-                    vnode = f"answer_value:{q}::{ans}"
-                    if not G.has_node(vnode):
-                        G.add_node(vnode, type="answer_value", question=q, value=ans)
-                    G.add_edge(qnode, vnode, rel="has_value")
-                    G.add_edge(pnode, vnode, rel="gave_value")
+
+            # (Optional) store answers on participant node for table view
+            for q in answer_cols:
+                v = None if pd.isna(row[q]) else str(row[q])
+                if v not in (None, ""):
+                    # store a few as attributes (avoid ballooning)
+                    # attr key: a sanitized version
+                    key = f"Q::{q}"
+                    G.nodes[pnode][key] = v
+
         st.session_state["G"] = G
-        st.success(f"Graph built ✅  Nodes: {G.number_of_nodes():,}  Edges: {G.number_of_edges():,}")
-# ----------------------------
-# Main Tabs (Query & Visualize)
-# ----------------------------
+        st.session_state["data_snapshot"] = {
+            "participant_col": participant_col,
+            "domain_cols": domain_cols,
+            "subdomain_cols": subdomain_cols,
+            "answer_cols": answer_cols,
+            "df_head": df.head(3).to_dict(orient="list")
+        }
+        st.success(f"Graph built ✅ Nodes: {G.number_of_nodes():,} | Edges: {G.number_of_edges():,}")
+
+# ---------- UI Tabs ----------
 if "G" in st.session_state:
     G = st.session_state["G"]
-    tab1, tab2, tab3 = st.tabs(["🔍 Queries", "🕸️ Graph View", "ℹ️ Node Inspector"])
-    # -------- Queries Tab --------
-    with tab1:
+    participant_col = st.session_state["data_snapshot"]["participant_col"]
+    domain_cols = st.session_state["data_snapshot"]["domain_cols"]
+    subdomain_cols = st.session_state["data_snapshot"]["subdomain_cols"]
+    answer_cols = st.session_state["data_snapshot"]["answer_cols"]
+
+    tabQ, tabG, tabI = st.tabs(["🔍 Queries", "🕸️ Graph (Ego View)", "ℹ️ Inspect"])
+
+    # ===== Queries =====
+    with tabQ:
         st.subheader("Quick Queries")
-        if not question_cols:
-            st.info("No question columns detected. Adjust your column mapping to analyze question answers.")
-        else:
-            colA, colB = st.columns(2)
-            # Query 1: How many participants share a specific answer to a question?
-            with colA:
-                st.markdown("**Q1. Participants with a specific answer**")
-                qsel = st.selectbox("Question", options=question_cols)
-                # Offer known values (from dataset)
-                vals = sorted(df[qsel].dropna().astype(str).unique().tolist())
-                vsel = st.selectbox("Answer value", options=vals)
-                run1 = st.button("Run Q1")
-                if run1:
-                    # Find participants where edge answer == vsel
-                    result = []
-                    qnode = f"question:{qsel}"
-                    if G.has_node(qnode):
-                        for nbr in G.neighbors(qnode):
-                            if G.nodes[nbr].get("type") == "participant":
-                                ans = G.get_edge_data(nbr, qnode).get("answer")
-                                if ans == vsel:
-                                    result.append(nbr.split("participant:", 1)[1])
-                    st.metric("Count", len(result))
-                    st.dataframe(pd.DataFrame({"Participant_ID": result}))
-            # Query 2: How many participants are grouped in a (sub)domain?
-            with colB:
-                st.markdown("**Q2. Participants by Domain/Subdomain**")
-                mode = st.radio("Type", ["Domain", "Subdomain"], horizontal=True)
-                # Collect all label values from graph nodes
-                label_type = "domain" if mode == "Domain" else "subdomain"
-                labels = [n for n, d in G.nodes(data=True) if d.get("type") == label_type]
-                labels_sorted = sorted([G.nodes[n]["label"] for n in labels]) if labels else []
-                lsel = st.selectbox(f"{mode} label", options=labels_sorted if labels_sorted else ["(none)"])
-                run2 = st.button("Run Q2")
-                if run2 and labels_sorted:
-                    lnode = f"{label_type}:{lsel}"
-                    participants = [n for n in G.neighbors(lnode) if G.nodes[n].get("type") == "participant"] if G.has_node(lnode) else []
-                    plist = [p.split("participant:", 1)[1] for p in participants]
-                    st.metric("Count", len(plist))
-                    st.dataframe(pd.DataFrame({"Participant_ID": plist}))
-            st.divider()
-            # Query 3: Show all answers for one participant (first N)
-            st.markdown("**Q3. Answers for a participant**")
-            # Offer IDs from dataset
-            pids = sorted(df[participant_col].dropna().astype(str).unique().tolist()) if uploaded is not None else []
-            psel = st.selectbox("Participant ID", options=pids)
-            max_show = st.slider("Max answers to display", 5, 100, 20)
-            run3 = st.button("Run Q3")
-            if run3:
-                pnode = f"participant:{psel}"
-                qa = []
+        c1, c2 = st.columns(2)
+
+        # Q1: Count/list by Domain/Subdomain
+        with c1:
+            mode = st.radio("Label type", ["Domain", "Subdomain"], horizontal=True)
+            ltype = "domain" if mode == "Domain" else "subdomain"
+            labels = sorted([d["label"] for n, d in G.nodes(data=True) if d.get("type") == ltype])
+            choice = st.selectbox(f"Select a {mode}", options=labels if labels else ["(none)"])
+            if st.button(f"Show participants in {mode}"):
+                target = f"{ltype}:{choice}"
+                plist = []
+                if G.has_node(target):
+                    for nbr in G.neighbors(target):
+                        if G.nodes[nbr].get("type") == "participant":
+                            plist.append(nbr.split("participant:", 1)[1])
+                st.metric("Participants", len(plist))
+                st.dataframe(pd.DataFrame({"Participant_ID": plist}))
+
+        # Q2: Show all labels for one participant
+        with c2:
+            # gather pids from graph
+            pids = sorted(n.split("participant:", 1)[1]
+                          for n, d in G.nodes(data=True) if d.get("type") == "participant")
+            pid = st.selectbox("Participant", options=pids)
+            if st.button("Show participant labels"):
+                pnode = f"participant:{pid}"
+                domains, sds = [], []
                 if G.has_node(pnode):
                     for nbr in G.neighbors(pnode):
-                        if G.nodes[nbr].get("type") == "question":
-                            edge = G.get_edge_data(pnode, nbr)
-                            qa.append((G.nodes[nbr]["label"], edge.get("answer")))
-                qa = qa[:max_show]
-                st.dataframe(pd.DataFrame(qa, columns=["Question", "Answer"]))
-    # -------- Graph View Tab --------
-    with tab2:
-        st.subheader("Interactive Graph (ego view)")
-        st.markdown(
-            "Render a compact **ego graph** around a participant to keep the visualization responsive."
-        )
-        pids = sorted(df[participant_col].dropna().astype(str).unique().tolist()) if uploaded is not None else []
-        psel = st.selectbox("Participant (ego center)", options=pids, key="ego_pid")
+                        t = G.nodes[nbr].get("type")
+                        if t == "domain": domains.append(G.nodes[nbr]["label"])
+                        if t == "subdomain": sds.append(G.nodes[nbr]["label"])
+                st.write("**Domains**:", sorted(set(domains)))
+                st.write("**Subdomains**:", sorted(set(sds)))
+
+        st.divider()
+        # Q3 (optional): Cohort by exact match on a few answer columns
+        st.markdown("**Cohort by exact matches on selected answer columns** (optional, simple filter)")
+        pick = st.multiselect("Pick up to 5 answer columns", options=answer_cols, default=answer_cols[:3])
+        vals = {}
+        for q in pick[:5]:
+            # propose value candidates from attributes found in graph (fallback to text box omitted for brevity)
+            vals[q] = st.text_input(f"Value for `{q}` (exact match)")
+
+        if st.button("Find participants with these answers"):
+            hits = []
+            for n, d in G.nodes(data=True):
+                if d.get("type") != "participant": continue
+                ok = True
+                for q, val in vals.items():
+                    if val is None or val == "": continue
+                    if d.get(f"Q::{q}") != val:
+                        ok = False; break
+                if ok: hits.append(n.split("participant:", 1)[1])
+            st.metric("Matched participants", len(hits))
+            st.dataframe(pd.DataFrame({"Participant_ID": hits}))
+
+    # ===== Graph (Ego View) =====
+    with tabG:
+        st.subheader("Interactive Ego View")
+        st.caption("Pick a node to center the view. Radius 1 shows direct neighbors (participants ↔ labels).")
+
+        # choose center type
+        focus_type = st.radio("Center type", ["Participant", "Domain", "Subdomain"], horizontal=True)
+        if focus_type == "Participant":
+            options = sorted(n.split("participant:", 1)[1] for n, d in G.nodes(data=True) if d.get("type") == "participant")
+            center_raw = st.selectbox("Participant ID", options=options)
+            center = f"participant:{center_raw}"
+        elif focus_type == "Domain":
+            options = sorted(d["label"] for n, d in G.nodes(data=True) if d.get("type") == "domain")
+            center_raw = st.selectbox("Domain", options=options)
+            center = f"domain:{center_raw}"
+        else:
+            options = sorted(d["label"] for n, d in G.nodes(data=True) if d.get("type") == "subdomain")
+            center_raw = st.selectbox("Subdomain", options=options)
+            center = f"subdomain:{center_raw}"
+
         radius = st.slider("Radius (hops)", 1, 2, 1)
-        max_nodes = st.slider("Max nodes to display", 50, 1000, 300, step=50)
-        if st.button("Render Ego Graph"):
-            center = f"participant:{psel}"
+        max_nodes = st.slider("Max nodes", 50, 2000, 500, step=50)
+
+        if st.button("Render"):
             if not G.has_node(center):
-                st.error("Participant not found in graph.")
+                st.error("Center node not found.")
             else:
                 H = nx.ego_graph(G, center, radius=radius, undirected=True)
-                # Trim extra-large ego graphs
+
+                # Trim if too large
                 if H.number_of_nodes() > max_nodes:
-                    # Keep center + highest-degree neighbors until under limit
-                    nodes_sorted = sorted(H.degree, key=lambda x: x[1], reverse=True)
-                    keep = set([center])
-                    for n, _deg in nodes_sorted:
-                        if len(keep) >= max_nodes:
-                            break
+                    # keep center, then highest-degree neighbors until limit
+                    deg_sorted = sorted(H.degree, key=lambda x: x[1], reverse=True)
+                    keep = {center}
+                    for n, _deg in deg_sorted:
+                        if len(keep) >= max_nodes: break
                         keep.add(n)
                     H = H.subgraph(keep).copy()
-                # Build PyVis network
-                net = Network(height="700px", width="100%", bgcolor="#ffffff", font_color="#222222", notebook=False, directed=False)
+
+                net = Network(height="740px", width="100%", bgcolor="#ffffff", font_color="#222")
                 net.barnes_hut()
-                # Map styles
-                def style_for(node_type):
-                    if node_type == "participant":
-                        return {"color": "#8ecae6", "shape": "dot", "size": 18}
-                    if node_type == "question":
-                        return {"color": "#90be6d", "shape": "ellipse", "size": 12}
-                    if node_type == "domain":
-                        return {"color": "#f4a261", "shape": "box", "size": 14}
-                    if node_type == "subdomain":
-                        return {"color": "#e76f51", "shape": "box", "size": 14}
-                    if node_type == "answer_value":
-                        return {"color": "#adb5bd", "shape": "diamond", "size": 10}
-                    return {"color": "#cccccc", "shape": "dot", "size": 10}
-                # Add nodes
+
+                def style(ntype):
+                    return {
+                        "participant": {"color": "#8ecae6", "shape": "dot", "size": 18},
+                        "domain": {"color": "#f4a261", "shape": "box", "size": 14},
+                        "subdomain": {"color": "#e76f51", "shape": "box", "size": 14},
+                    }.get(ntype, {"color": "#cccccc", "shape": "dot", "size": 10})
+
                 for n, d in H.nodes(data=True):
                     t = d.get("type", "other")
-                    sty = style_for(t)
-                    label = d.get("label", "")
+                    lab = d.get("label", "")
                     if t == "participant":
-                        label = n.split("participant:", 1)[1]
-                    if t == "answer_value":
-                        label = d.get("value", "")
-                    net.add_node(n, label=label or n, title=f"type={t}", **sty)
-                # Add edges (show answer on participant-question edges)
+                        lab = n.split("participant:", 1)[1]
+                    net.add_node(n, label=lab or n, title=f"type={t}", **style(t))
+
                 for u, v, ed in H.edges(data=True):
-                    title = ed.get("rel", "")
-                    if ed.get("rel") == "answered":
-                        # Find the answer text and show as tooltip
-                        if H.nodes[u].get("type") == "participant" and H.nodes[v].get("type") == "question":
-                            title = f"answered: {ed.get('answer', '')}"
-                        elif H.nodes[v].get("type") == "participant" and H.nodes[u].get("type") == "question":
-                            title = f"answered: {ed.get('answer', '')}"
-                    net.add_edge(u, v, title=title, physics=True)
-                # Render
+                    net.add_edge(u, v, title=ed.get("rel", ""))
+
                 html = net.generate_html()
-                st.components.v1.html(html, height=730, scrolling=True)
-    # -------- Node Inspector Tab --------
-    with tab3:
-        st.subheader("Node Inspector")
-        st.markdown("Lookup a node by exact ID (e.g., `participant:123`, `question:Q15`, `domain:Health`).")
-        nid = st.text_input("Node ID")
+                st.components.v1.html(html, height=760, scrolling=True)
+
+    # ===== Inspect =====
+    with tabI:
+        st.subheader("Inspect Node")
+        nid = st.text_input("Node ID (e.g., participant:123, domain:Health, subdomain:Exercise)")
         if st.button("Inspect"):
             if not G.has_node(nid):
-                st.error("Node not found.")
+                st.error("Not found.")
             else:
                 st.write("**Attributes:**", G.nodes[nid])
-                nbrs = list(G.neighbors(nid))
-                st.write(f"**Neighbors ({len(nbrs)}):**", nbrs[:200] + (["..."] if len(nbrs) > 200 else []))
+                neighbors = list(G.neighbors(nid))
+                st.write(f"**Neighbors ({len(neighbors)}):**", neighbors[:200] + (["..."] if len(neighbors) > 200 else []))
 else:
-    st.info("Upload a CSV and configure columns in the sidebar to get started.")
+    st.info("Upload your CSV, map the columns, then click **Build Knowledge Graph**.")
