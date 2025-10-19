@@ -1,166 +1,95 @@
-# app_custom.py
+# auth_core.py
 import json
-import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any
 
 import bcrypt
-import streamlit as st
 
-st.set_page_config(page_title="Custom Streamlit Login", page_icon="🔒")
 
-USERS_PATH = Path(os.getenv("USERS_JSON_PATH", "users.json"))
+@dataclass
+class UserRecord:
+    name: str
+    password_hash: str
 
-# ---------------- Utilities ----------------
-def _default_users() -> Dict[str, Any]:
-    # Demo users: admin/admin123, jane/pass123
-    return {
-        "admin": {
-            "name": "Admin User",
-            "password_hash": bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode("utf-8"),
-        },
-        "jane": {
-            "name": "Jane Doe",
-            "password_hash": bcrypt.hashpw(b"pass123", bcrypt.gensalt()).decode("utf-8"),
-        },
-    }
-
-def load_users() -> Dict[str, Any]:
-    if not USERS_PATH.exists():
-        users = _default_users()
-        save_users(users)
-        return users
-    try:
-        with open(USERS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        # Fallback to default if file is corrupted
-        users = _default_users()
-        save_users(users)
-        return users
-
-def save_users(users: Dict[str, Any]) -> None:
-    with open(USERS_PATH, "w", encoding="utf-8") as f:
-        json.dump(users, f, indent=2)
 
 def hash_password(password: str) -> str:
+    """Hash a password with bcrypt and return the utf-8 string hash."""
+    if not isinstance(password, str):
+        raise TypeError("password must be a string")
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
+
 def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a plaintext password against a bcrypt hash."""
+    if not isinstance(password, str) or not isinstance(password_hash, str):
+        return False
     try:
         return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
     except Exception:
         return False
 
-# ---------------- State helpers ----------------
-if "auth" not in st.session_state:
-    st.session_state["auth"] = False
-if "username" not in st.session_state:
-    st.session_state["username"] = None
-if "name" not in st.session_state:
-    st.session_state["name"] = None
-if "login_attempts" not in st.session_state:
-    st.session_state["login_attempts"] = 0
 
-users = load_users()
+def default_users() -> Dict[str, Dict[str, str]]:
+    """Return a default demo user set (admin/admin123, jane/pass123)."""
+    return {
+        "admin": {"name": "Admin User", "password_hash": hash_password("admin123")},
+        "jane": {"name": "Jane Doe", "password_hash": hash_password("pass123")},
+    }
 
-# ---------------- UI ----------------
-st.title("🔒 Custom Login (Streamlit + bcrypt)")
 
-tab_login, tab_register, tab_reset = st.tabs(["Login", "Register", "Reset Password"])
+def save_users(path: Path, users: Dict[str, Dict[str, str]]) -> None:
+    """Save users dictionary to JSON at path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(users, f, indent=2)
 
-with tab_login:
-    st.subheader("Login")
-    if st.session_state["auth"]:
-        st.success(f"Already logged in as {st.session_state['name']} ({st.session_state['username']}).")
-        if st.button("Logout"):
-            st.session_state["auth"] = False
-            st.session_state["username"] = None
-            st.session_state["name"] = None
-            st.info("Logged out.")
-    else:
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Login")
 
-        if submitted:
-            st.session_state["login_attempts"] += 1
-            if st.session_state["login_attempts"] > 10:
-                st.error("Too many attempts. Please reload the page and try again.")
-            else:
-                if username in users and verify_password(password, users[username]["password_hash"]):
-                    st.session_state["auth"] = True
-                    st.session_state["username"] = username
-                    st.session_state["name"] = users[username]["name"]
-                    st.session_state["login_attempts"] = 0
-                    st.success(f"Welcome, {st.session_state['name']}!")
-                else:
-                    st.error("Invalid username or password.")
+def load_users(path: Path, create_default: bool = True) -> Dict[str, Dict[str, str]]:
+    """Load users from JSON. If not exists or invalid and create_default, return and write defaults."""
+    if not path.exists():
+        if create_default:
+            users = default_users()
+            save_users(path, users)
+            return users
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Users JSON must be an object")
+            return data
+    except Exception:
+        if create_default:
+            users = default_users()
+            save_users(path, users)
+            return users
+        return {}
 
-with tab_register:
-    st.subheader("Register")
-    st.caption("Demo registration stored in a local JSON file. Do not use this as-is for production.")
-    with st.form("register_form", clear_on_submit=False):
-        full_name = st.text_input("Full name")
-        new_username = st.text_input("Username")
-        new_password = st.text_input("Password", type="password")
-        confirm_password = st.text_input("Confirm password", type="password")
-        submitted = st.form_submit_button("Create account")
-    if submitted:
-        if not full_name or not new_username or not new_password:
-            st.warning("Please fill in all fields.")
-        elif new_password != confirm_password:
-            st.warning("Passwords do not match.")
-        elif new_username in users:
-            st.error("Username already exists.")
-        else:
-            users[new_username] = {"name": full_name, "password_hash": hash_password(new_password)}
-            save_users(users)
-            st.success(f"User '{new_username}' registered. You can log in now.")
 
-with tab_reset:
-    st.subheader("Reset Password")
-    st.caption("Requires your current password. This updates the local JSON file.")
-    with st.form("reset_form"):
-        rp_username = st.text_input("Username", value=st.session_state.get("username") or "")
-        old_password = st.text_input("Current password", type="password")
-        new_password = st.text_input("New password", type="password")
-        confirm_new = st.text_input("Confirm new password", type="password")
-        submitted = st.form_submit_button("Change password")
-    if submitted:
-        if rp_username not in users:
-            st.error("User not found.")
-        elif not verify_password(old_password, users[rp_username]["password_hash"]):
-            st.error("Current password is incorrect.")
-        elif not new_password or new_password != confirm_new:
-            st.error("New passwords do not match or are empty.")
-        else:
-            users[rp_username]["password_hash"] = hash_password(new_password)
-            save_users(users)
-            st.success("Password updated successfully.")
+def register_user(users: Dict[str, Dict[str, str]], username: str, full_name: str, password: str) -> None:
+    """Add a new user to the users dict. Raises ValueError if invalid or exists."""
+    if not username or not full_name or not password:
+        raise ValueError("All fields are required")
+    if username in users:
+        raise ValueError("Username already exists")
+    users[username] = {"name": full_name, "password_hash": hash_password(password)}
 
-st.divider()
-if st.session_state["auth"]:
-    st.header("Protected content")
-    st.write("🎉 You are authenticated. Put your app here.")
-    with st.sidebar:
-        st.caption(f"Logged in as **{st.session_state['name']}** ({st.session_state['username']})")
-        if st.button("Logout", key="logout_sidebar"):
-            st.session_state["auth"] = False
-            st.session_state["username"] = None
-            st.session_state["name"] = None
-            st.info("Logged out.")
-else:
-    st.info("Log in to view protected content.")
 
-with st.sidebar.expander("Security notes"):
-    st.markdown(
-        """
-- This demo stores users in a local **JSON** file (`users.json`). For real apps, use a database.
-- Always store **hashed** passwords (bcrypt or Argon2), never plain text.
-- Serve your app behind HTTPS/reverse proxy in production.
-- You can set the `USERS_JSON_PATH` environment variable to control the user store location.
-- Session persistence here uses `st.session_state` only; closing the tab resets it.
-        """
-    )
+def can_login(users: Dict[str, Dict[str, str]], username: str, password: str) -> bool:
+    """Return True if username exists and password verifies."""
+    rec = users.get(username)
+    if not rec or "password_hash" not in rec:
+        return False
+    return verify_password(password, rec["password_hash"])
+
+
+def reset_password(users: Dict[str, Dict[str, str]], username: str, old_password: str, new_password: str) -> None:
+    """Reset password for a user after verifying old password. Raises ValueError on failure."""
+    if username not in users:
+        raise ValueError("User not found")
+    if not verify_password(old_password, users[username]["password_hash"]):
+        raise ValueError("Current password is incorrect")
+    if not new_password:
+        raise ValueError("New password cannot be empty")
+    users[username]["password_hash"] = hash_password(new_password)
