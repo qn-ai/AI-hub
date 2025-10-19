@@ -1,95 +1,97 @@
-# auth_core.py
-import json
-from dataclasses import dataclass
+# test_auth_core.py
 from pathlib import Path
-from typing import Dict, Any
+import json
+import pytest
 
-import bcrypt
-
-
-@dataclass
-class UserRecord:
-    name: str
-    password_hash: str
-
-
-def hash_password(password: str) -> str:
-    """Hash a password with bcrypt and return the utf-8 string hash."""
-    if not isinstance(password, str):
-        raise TypeError("password must be a string")
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+from auth_core import (
+    hash_password,
+    verify_password,
+    default_users,
+    save_users,
+    load_users,
+    register_user,
+    can_login,
+    reset_password,
+)
 
 
-def verify_password(password: str, password_hash: str) -> bool:
-    """Verify a plaintext password against a bcrypt hash."""
-    if not isinstance(password, str) or not isinstance(password_hash, str):
-        return False
-    try:
-        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
-    except Exception:
-        return False
+def test_hash_and_verify_roundtrip():
+    pw = "S3cure!"
+    h = hash_password(pw)
+    assert h != pw
+    assert verify_password(pw, h)
+    assert not verify_password("wrong", h)
 
 
-def default_users() -> Dict[str, Dict[str, str]]:
-    """Return a default demo user set (admin/admin123, jane/pass123)."""
-    return {
-        "admin": {"name": "Admin User", "password_hash": hash_password("admin123")},
-        "jane": {"name": "Jane Doe", "password_hash": hash_password("pass123")},
-    }
+def test_default_users_can_login():
+    users = default_users()
+    assert can_login(users, "admin", "admin123")
+    assert can_login(users, "jane", "pass123")
+    assert not can_login(users, "admin", "wrong")
+    assert not can_login(users, "ghost", "admin123")
 
 
-def save_users(path: Path, users: Dict[str, Dict[str, str]]) -> None:
-    """Save users dictionary to JSON at path."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(users, f, indent=2)
+def test_save_and_load_users(tmp_path: Path):
+    users = default_users()
+    p = tmp_path / "users.json"
+    save_users(p, users)
+    loaded = load_users(p, create_default=False)
+    assert set(loaded.keys()) == set(users.keys())
+    # verify that hashes work
+    assert verify_password("admin123", loaded["admin"]["password_hash"])
 
 
-def load_users(path: Path, create_default: bool = True) -> Dict[str, Dict[str, str]]:
-    """Load users from JSON. If not exists or invalid and create_default, return and write defaults."""
-    if not path.exists():
-        if create_default:
-            users = default_users()
-            save_users(path, users)
-            return users
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError("Users JSON must be an object")
-            return data
-    except Exception:
-        if create_default:
-            users = default_users()
-            save_users(path, users)
-            return users
-        return {}
+def test_load_users_creates_default_when_missing(tmp_path: Path):
+    p = tmp_path / "missing.json"
+    assert not p.exists()
+    users = load_users(p, create_default=True)
+    assert "admin" in users and "jane" in users
+    assert p.exists()
 
 
-def register_user(users: Dict[str, Dict[str, str]], username: str, full_name: str, password: str) -> None:
-    """Add a new user to the users dict. Raises ValueError if invalid or exists."""
-    if not username or not full_name or not password:
-        raise ValueError("All fields are required")
-    if username in users:
-        raise ValueError("Username already exists")
-    users[username] = {"name": full_name, "password_hash": hash_password(password)}
+def test_load_users_returns_empty_when_missing_and_no_default(tmp_path: Path):
+    p = tmp_path / "missing.json"
+    users = load_users(p, create_default=False)
+    assert users == {}
+    assert not p.exists()
 
 
-def can_login(users: Dict[str, Dict[str, str]], username: str, password: str) -> bool:
-    """Return True if username exists and password verifies."""
-    rec = users.get(username)
-    if not rec or "password_hash" not in rec:
-        return False
-    return verify_password(password, rec["password_hash"])
+def test_load_users_recovers_from_corruption(tmp_path: Path):
+    p = tmp_path / "users.json"
+    p.write_text("{not json", encoding="utf-8")
+    users = load_users(p, create_default=True)
+    assert "admin" in users  # fell back to defaults
 
 
-def reset_password(users: Dict[str, Dict[str, str]], username: str, old_password: str, new_password: str) -> None:
-    """Reset password for a user after verifying old password. Raises ValueError on failure."""
-    if username not in users:
-        raise ValueError("User not found")
-    if not verify_password(old_password, users[username]["password_hash"]):
-        raise ValueError("Current password is incorrect")
-    if not new_password:
-        raise ValueError("New password cannot be empty")
-    users[username]["password_hash"] = hash_password(new_password)
+def test_register_user_and_login(tmp_path: Path):
+    p = tmp_path / "users.json"
+    users = {}
+    register_user(users, "alice", "Alice A.", "alicepw")
+    assert can_login(users, "alice", "alicepw")
+    save_users(p, users)
+    loaded = load_users(p, create_default=False)
+    assert can_login(loaded, "alice", "alicepw")
+
+    with pytest.raises(ValueError):
+        register_user(users, "alice", "Another", "x")  # duplicate
+
+    with pytest.raises(ValueError):
+        register_user(users, "", "No Name", "x")  # invalid input
+
+
+def test_reset_password_flow():
+    users = default_users()
+    # wrong current
+    with pytest.raises(ValueError):
+        reset_password(users, "admin", "wrong", "newpw")
+
+    # correct flow
+    reset_password(users, "admin", "admin123", "newpw")
+    assert can_login(users, "admin", "newpw")
+    assert not can_login(users, "admin", "admin123")
+
+
+def test_password_hash_is_not_plaintext():
+    users = default_users()
+    admin_hash = users["admin"]["password_hash"]
+    assert "admin123" not in admin_hash
