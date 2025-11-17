@@ -1,3 +1,12 @@
+def accuracy_per_target(y_true_df, y_pred_df):
+    acc = {}
+    for col in y_true_df.columns:
+        acc[col] = (y_true_df[col] == y_pred_df[col]).mean()
+    return acc, np.mean(list(acc.values()))
+
+def exact_match_accuracy(y_true_df, y_pred_df):
+    return (y_true_df.values == y_pred_df.values).all(axis=1).mean()
+
 # Metrics
 hgb_scores, hgb_mean_f1 = macro_f1_per_target(Y_val, hgb_preds)
 
