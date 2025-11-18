@@ -1,14 +1,15 @@
 """
-Multi-task classification with missing labels per target.
+Multi-task classification with:
+- Probabilities
+- Feature importances
+- Cross-validation
+- Categorical feature handling
+- Parallelization
 
-- Assumes a CSV with:
-    * Feature columns
-    * Label columns starting with 'y_'
-    * Optional ID column 'id_pwd_id'
-- Trains one HistGradientBoostingClassifier per target (handles missing labels by
-  training only on rows where that label is present).
-- Evaluates on a validation split.
-- Writes predictions back to a CSV alongside original data.
+Conventions:
+- Feature columns start with: ft_
+- Target/label columns start with: y_
+- ID columns start with: id_
 """
 
 import warnings
@@ -17,22 +18,93 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 
-from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score
 from sklearn.metrics import accuracy_score
 
 
 # =========================
 # CONFIG
 # =========================
-DATA_PATH = "input_data.csv"          # <-- change to your file path
+DATA_PATH = "input_data.csv"              # <-- change to your file
 OUTPUT_PATH = "input_with_predictions.csv"
 
-TARGET_PREFIX = "y_"                  # label columns start with this
-MIN_LABELLED = 500                    # minimum labelled samples per target
-TEST_SIZE = 0.2
+FEATURE_PREFIX = "ft_"
+TARGET_PREFIX = "y_"
+ID_PREFIX = "id_"
+
+MIN_LABELLED = 500                        # min labelled rows per target
+CV_FOLDS = 5
 RANDOM_STATE = 42
+
+# RandomForest settings (good balance speed/quality)
+RF_PARAMS = dict(
+    n_estimators=300,
+    max_depth=None,
+    n_jobs=-1,
+    random_state=RANDOM_STATE,
+)
+
+
+def build_preprocessor(df, feature_cols):
+    """Build ColumnTransformer with numeric + categorical pipelines."""
+    # Identify numeric vs categorical ft_ columns
+    num_cols = [
+        c for c in feature_cols
+        if pd.api.types.is_numeric_dtype(df[c])
+    ]
+    cat_cols = [c for c in feature_cols if c not in num_cols]
+
+    print(f"  Numeric features: {len(num_cols)}")
+    print(f"  Categorical features: {len(cat_cols)}")
+
+    num_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+    ])
+
+    cat_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
+    ])
+
+    transformers = []
+    if num_cols:
+        transformers.append(("num", num_pipe, num_cols))
+    if cat_cols:
+        transformers.append(("cat", cat_pipe, cat_cols))
+
+    preprocessor = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop"
+    )
+
+    return preprocessor, num_cols, cat_cols
+
+
+def get_feature_names(preprocessor, num_cols, cat_cols):
+    """
+    Retrieve final feature names after preprocessing.
+    Works for ColumnTransformer(num, cat) + OneHotEncoder.
+    """
+    feature_names = []
+
+    # Numeric: names unchanged
+    if num_cols:
+        feature_names.extend(num_cols)
+
+    # Categorical: expand via OneHotEncoder
+    if cat_cols:
+        cat_transformer = preprocessor.named_transformers_.get("cat")
+        if cat_transformer is not None:
+            ohe = cat_transformer.named_steps["onehot"]
+            cat_feat_names = ohe.get_feature_names_out(cat_cols)
+            feature_names.extend(cat_feat_names)
+
+    return np.array(feature_names)
 
 
 def main():
@@ -41,43 +113,47 @@ def main():
     # -------------------------
     print(f"Loading data from: {DATA_PATH}")
     df = pd.read_csv(DATA_PATH)
-
-    n_rows, n_cols = df.shape
-    print(f"Data shape: {n_rows} rows x {n_cols} columns")
-
-    # Optional ID column (will be kept & used only for merge / inspection)
-    id_col = "id_pwd_id" if "id_pwd_id" in df.columns else None
-    if id_col:
-        print(f"Detected ID column: {id_col}")
+    print(f"Data shape: {df.shape[0]} rows x {df.shape[1]} cols")
 
     # -------------------------
-    # 2. Identify label & feature columns
+    # 2. Identify columns
     # -------------------------
+    id_cols = [c for c in df.columns if c.startswith(ID_PREFIX)]
+    feature_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
     target_cols = [c for c in df.columns if c.startswith(TARGET_PREFIX)]
 
+    print(f"ID columns: {id_cols}")
+    print(f"Feature columns (ft_): {len(feature_cols)}")
+    print(f"Target columns (y_): {len(target_cols)}")
+
+    if not feature_cols:
+        raise ValueError(f"No feature columns starting with '{FEATURE_PREFIX}'")
     if not target_cols:
-        raise ValueError(f"No columns start with prefix '{TARGET_PREFIX}'.")
+        raise ValueError(f"No target columns starting with '{TARGET_PREFIX}'")
 
-    print(f"Detected {len(target_cols)} target columns with prefix '{TARGET_PREFIX}'.")
-
-    feature_cols = [c for c in df.columns if c not in target_cols]
-    X = df[feature_cols].copy()
-    Y = df[target_cols].copy()
+    X_full = df[feature_cols].copy()
+    Y_full = df[target_cols].copy()
 
     # -------------------------
-    # 3. Filter targets by minimum labelled samples
+    # 3. Build preprocessor (numeric + categorical)
     # -------------------------
-    label_counts = Y.notna().sum().to_frame("n_labelled")
+    print("\nBuilding preprocessor...")
+    preprocessor, num_cols, cat_cols = build_preprocessor(df, feature_cols)
+
+    # -------------------------
+    # 4. Filter targets by number of labelled rows
+    # -------------------------
+    label_counts = Y_full.notna().sum().to_frame("n_labelled")
     label_counts["total"] = len(df)
     label_counts["n_missing"] = label_counts["total"] - label_counts["n_labelled"]
     label_counts["frac_missing"] = label_counts["n_missing"] / label_counts["total"]
 
-    print("\nLabelled count per target (head):")
+    print("\nTargets sorted by labelled count (lowest first):")
     print(label_counts.sort_values("n_labelled").head(10))
 
     good_targets = [
-        col for col in target_cols
-        if Y[col].notna().sum() >= MIN_LABELLED
+        c for c in target_cols
+        if Y_full[c].notna().sum() >= MIN_LABELLED
     ]
     bad_targets = sorted(set(target_cols) - set(good_targets))
 
@@ -87,128 +163,155 @@ def main():
         print("Example dropped targets:", bad_targets[:10])
 
     if not good_targets:
-        raise ValueError(
-            f"No targets have at least {MIN_LABELLED} labelled samples. "
-            "Lower MIN_LABELLED and retry."
-        )
-
-    Y_good = Y[good_targets].copy()
+        raise ValueError("No targets meet MIN_LABELLED. Reduce threshold and retry.")
 
     # -------------------------
-    # 4. Train/validation split
+    # 5. Train per target (CV + fit full model)
     # -------------------------
-    X_train, X_val, Y_train, Y_val = train_test_split(
-        X, Y_good, test_size=TEST_SIZE, random_state=RANDOM_STATE
-    )
+    per_target_results = []
+    preds_labels = {}
+    preds_probs = {}  # dict: (col, class) -> column of probs
 
-    print(f"\nTrain size: {len(X_train)} rows")
-    print(f"Validation size: {len(X_val)} rows")
-
-    # -------------------------
-    # 5. Train one model per target
-    # -------------------------
-    models = {}
-    accs = {}
-
-    print("\nTraining models per target...")
+    print("\nTraining models per target with CV...")
     for col in good_targets:
-        y_train_col = Y_train[col]
+        print(f"\n=== Target: {col} ===")
 
-        # Use only rows where this target is labelled
-        mask_train = ~y_train_col.isna()
-        n_train_labelled = mask_train.sum()
+        y = Y_full[col]
+        mask = ~y.isna()          # rows where label is present
+        n_labelled = mask.sum()
 
-        # Skip if not enough labelled data in TRAIN split
-        if n_train_labelled < max(100, MIN_LABELLED // 3):
-            print(
-                f"  [SKIP] {col}: only {n_train_labelled} labelled rows in train "
-                f"(< {max(100, MIN_LABELLED // 3)})"
-            )
-            accs[col] = np.nan
+        print(f"  Labelled rows: {n_labelled}")
+
+        if n_labelled < MIN_LABELLED:
+            print(f"  [SKIP] Not enough labelled rows after filter.")
+            per_target_results.append({
+                "target": col,
+                "n_labelled": n_labelled,
+                "cv_mean_acc": np.nan,
+                "cv_std_acc": np.nan,
+                "train_acc_full": np.nan,
+            })
             continue
 
-        # Need at least 2 classes
-        unique_classes = y_train_col[mask_train].unique()
+        X_lab = X_full.loc[mask]
+        y_lab = y.loc[mask]
+
+        # Need >1 class
+        unique_classes = np.unique(y_lab)
         if len(unique_classes) < 2:
-            print(
-                f"  [SKIP] {col}: only one class present in train "
-                f"({unique_classes})"
-            )
-            accs[col] = np.nan
+            print(f"  [SKIP] Only one class present: {unique_classes}")
+            per_target_results.append({
+                "target": col,
+                "n_labelled": n_labelled,
+                "cv_mean_acc": np.nan,
+                "cv_std_acc": np.nan,
+                "train_acc_full": np.nan,
+            })
             continue
 
-        clf = HistGradientBoostingClassifier(
-            learning_rate=0.06,
-            max_depth=None,
-            max_bins=255,
-            l2_regularization=0.0,
-            early_stopping=True,
-            random_state=RANDOM_STATE,
+        # Build pipeline: preprocess -> RandomForest
+        pipe = Pipeline([
+            ("pre", preprocessor),
+            ("clf", RandomForestClassifier(**RF_PARAMS)),
+        ])
+
+        # 5a. Cross-validation accuracy
+        print(f"  Running {CV_FOLDS}-fold CV (this may take a bit)...")
+        cv_scores = cross_val_score(
+            pipe,
+            X_lab,
+            y_lab,
+            cv=CV_FOLDS,
+            scoring="accuracy",
+            n_jobs=-1,
         )
+        cv_mean = cv_scores.mean()
+        cv_std = cv_scores.std()
+        print(f"  CV accuracy: mean={cv_mean:.4f}, std={cv_std:.4f}")
 
-        clf.fit(X_train[mask_train], y_train_col[mask_train])
-        models[col] = clf
+        # 5b. Fit on all labelled data
+        print("  Fitting model on all labelled rows...")
+        pipe.fit(X_lab, y_lab)
 
-        # Validation accuracy: only rows where target is labelled in val
-        y_val_col = Y_val[col]
-        mask_val = ~y_val_col.isna()
+        # Optional: training accuracy on labelled rows
+        y_lab_pred = pipe.predict(X_lab)
+        train_acc_full = accuracy_score(y_lab, y_lab_pred)
+        print(f"  Train accuracy on labelled rows: {train_acc_full:.4f}")
 
-        if mask_val.sum() == 0:
-            print(f"  [NO VAL LABELS] {col}: accuracy set to NaN")
-            accs[col] = np.nan
-            continue
+        # 5c. Feature importances
+        clf = pipe.named_steps["clf"]
+        pre_fitted = pipe.named_steps["pre"]
 
-        y_val_true = y_val_col[mask_val]
-        y_val_pred = clf.predict(X_val[mask_val])
+        feature_names = get_feature_names(pre_fitted, num_cols, cat_cols)
+        importances = clf.feature_importances_
 
-        acc = accuracy_score(y_val_true, y_val_pred)
-        accs[col] = acc
+        fi_df = pd.DataFrame({
+            "feature": feature_names,
+            "importance": importances,
+        }).sort_values("importance", ascending=False)
 
-        print(f"  [OK] {col}: train_labelled={n_train_labelled}, "
-              f"val_labelled={mask_val.sum()}, accuracy={acc:.4f}")
+        fi_path = f"feature_importances_{col}.csv"
+        fi_df.to_csv(fi_path, index=False)
+        print(f"  Feature importances saved → {fi_path}")
+
+        # 5d. Predict for ALL rows (labels + probs)
+        print("  Predicting for ALL rows (including originally missing labels)...")
+        y_all_pred = pipe.predict(X_full)
+        preds_labels[col + "_pred"] = y_all_pred
+
+        # Predict probabilities
+        if hasattr(pipe.named_steps["clf"], "predict_proba"):
+            proba_all = pipe.predict_proba(X_full)  # shape: (n_samples, n_classes)
+            classes = pipe.named_steps["clf"].classes_
+
+            if len(classes) == 2:
+                # For binary, store probability of positive class only
+                pos_class = classes[1]
+                prob_col_name = f"{col}_proba_{pos_class}"
+                preds_probs[prob_col_name] = proba_all[:, 1]
+            else:
+                # For multiclass, one column per class
+                for i, cls in enumerate(classes):
+                    prob_col_name = f"{col}_proba_{cls}"
+                    preds_probs[prob_col_name] = proba_all[:, i]
+
+        # Store summary
+        per_target_results.append({
+            "target": col,
+            "n_labelled": n_labelled,
+            "cv_mean_acc": cv_mean,
+            "cv_std_acc": cv_std,
+            "train_acc_full": train_acc_full,
+        })
 
     # -------------------------
-    # 6. Accuracy summary: per target + min/max
+    # 6. Save per-target results (accuracy stats)
     # -------------------------
-    accs_series = pd.Series(accs, name="accuracy")
-    accs_df = accs_series.to_frame().sort_values("accuracy")
+    results_df = pd.DataFrame(per_target_results)
+    results_df = results_df.sort_values("cv_mean_acc", ascending=True)
+    results_df.to_csv("per_target_results_cv.csv", index=False)
+    print("\nPer-target CV results saved → per_target_results_cv.csv")
 
-    print("\nPer-target validation accuracy (sorted):")
-    print(accs_df)
-
-    # Exclude NaN when computing min/max
-    valid_accs = accs_series.dropna()
-    if not valid_accs.empty:
-        min_acc = valid_accs.min()
-        max_acc = valid_accs.max()
-        print(f"\nMin validation accuracy: {min_acc:.4f}")
-        print(f"Max validation accuracy: {max_acc:.4f}")
+    # Min/max (excluding NaNs)
+    valid = results_df["cv_mean_acc"].dropna()
+    if not valid.empty:
+        print(f"\nMin CV accuracy: {valid.min():.4f}")
+        print(f"Max CV accuracy: {valid.max():.4f}")
     else:
-        print("\nNo valid accuracies (all NaN). Check your data/thresholds.")
-
-    # Optionally save accuracies
-    accs_df.to_csv("per_target_accuracy.csv", index=True)
-    print("Per-target accuracies saved to: per_target_accuracy.csv")
+        print("\nNo valid CV accuracies (all NaN).")
 
     # -------------------------
-    # 7. Predict for ALL rows and merge back into original df
+    # 7. Merge predictions & probabilities back to df
     # -------------------------
-    print("\nPredicting labels for ALL rows and merging with input data...")
+    print("\nMerging predictions and probabilities back to original dataframe...")
 
-    # We'll use the models trained on the train split (no refit on full data)
-    # and predict for ALL X.
-    preds = {}
-    for col, clf in models.items():
-        preds[col + "_pred"] = clf.predict(X)
+    preds_labels_df = pd.DataFrame(preds_labels, index=df.index)
+    preds_probs_df = pd.DataFrame(preds_probs, index=df.index)
 
-    preds_df = pd.DataFrame(preds, index=df.index)
+    df_out = pd.concat([df, preds_labels_df, preds_probs_df], axis=1)
+    df_out.to_csv(OUTPUT_PATH, index=False)
 
-    # Merge predictions with original data
-    df_with_preds = pd.concat([df, preds_df], axis=1)
-
-    # Save to CSV
-    df_with_preds.to_csv(OUTPUT_PATH, index=False)
-    print(f"Full data with predictions saved to: {OUTPUT_PATH}")
+    print(f"All predictions saved → {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
