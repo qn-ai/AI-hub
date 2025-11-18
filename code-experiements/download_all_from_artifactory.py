@@ -41,7 +41,7 @@ MIN_LABELLED = 500                        # min labelled rows per target
 CV_FOLDS = 5
 RANDOM_STATE = 42
 
-# RandomForest settings (good balance speed/quality)
+# RandomForest settings
 RF_PARAMS = dict(
     n_estimators=300,
     max_depth=None,
@@ -52,7 +52,6 @@ RF_PARAMS = dict(
 
 def build_preprocessor(df, feature_cols):
     """Build ColumnTransformer with numeric + categorical pipelines."""
-    # Identify numeric vs categorical ft_ columns
     num_cols = [
         c for c in feature_cols
         if pd.api.types.is_numeric_dtype(df[c])
@@ -86,17 +85,12 @@ def build_preprocessor(df, feature_cols):
 
 
 def get_feature_names(preprocessor, num_cols, cat_cols):
-    """
-    Retrieve final feature names after preprocessing.
-    Works for ColumnTransformer(num, cat) + OneHotEncoder.
-    """
+    """Retrieve final feature names after preprocessing."""
     feature_names = []
 
-    # Numeric: names unchanged
     if num_cols:
         feature_names.extend(num_cols)
 
-    # Categorical: expand via OneHotEncoder
     if cat_cols:
         cat_transformer = preprocessor.named_transformers_.get("cat")
         if cat_transformer is not None:
@@ -113,7 +107,8 @@ def main():
     # -------------------------
     print(f"Loading data from: {DATA_PATH}")
     df = pd.read_csv(DATA_PATH)
-    print(f"Data shape: {df.shape[0]} rows x {df.shape[1]} cols")
+    n_rows = len(df)
+    print(f"Data shape: {n_rows} rows x {df.shape[1]} cols")
 
     # -------------------------
     # 2. Identify columns
@@ -135,7 +130,7 @@ def main():
     Y_full = df[target_cols].copy()
 
     # -------------------------
-    # 3. Build preprocessor (numeric + categorical)
+    # 3. Build preprocessor
     # -------------------------
     print("\nBuilding preprocessor...")
     preprocessor, num_cols, cat_cols = build_preprocessor(df, feature_cols)
@@ -166,11 +161,13 @@ def main():
         raise ValueError("No targets meet MIN_LABELLED. Reduce threshold and retry.")
 
     # -------------------------
-    # 5. Train per target (CV + fit full model)
+    # 5. Train per target
     # -------------------------
     per_target_results = []
-    preds_labels = {}
-    preds_probs = {}  # dict: (col, class) -> column of probs
+
+    # We'll build these DataFrames column by column (avoids length issues)
+    preds_labels_df = pd.DataFrame(index=df.index)
+    preds_probs_df = pd.DataFrame(index=df.index)
 
     print("\nTraining models per target with CV...")
     for col in good_targets:
@@ -196,7 +193,6 @@ def main():
         X_lab = X_full.loc[mask]
         y_lab = y.loc[mask]
 
-        # Need >1 class
         unique_classes = np.unique(y_lab)
         if len(unique_classes) < 2:
             print(f"  [SKIP] Only one class present: {unique_classes}")
@@ -209,14 +205,13 @@ def main():
             })
             continue
 
-        # Build pipeline: preprocess -> RandomForest
         pipe = Pipeline([
             ("pre", preprocessor),
             ("clf", RandomForestClassifier(**RF_PARAMS)),
         ])
 
         # 5a. Cross-validation accuracy
-        print(f"  Running {CV_FOLDS}-fold CV (this may take a bit)...")
+        print(f"  Running {CV_FOLDS}-fold CV...")
         cv_scores = cross_val_score(
             pipe,
             X_lab,
@@ -233,7 +228,6 @@ def main():
         print("  Fitting model on all labelled rows...")
         pipe.fit(X_lab, y_lab)
 
-        # Optional: training accuracy on labelled rows
         y_lab_pred = pipe.predict(X_lab)
         train_acc_full = accuracy_score(y_lab, y_lab_pred)
         print(f"  Train accuracy on labelled rows: {train_acc_full:.4f}")
@@ -254,28 +248,48 @@ def main():
         fi_df.to_csv(fi_path, index=False)
         print(f"  Feature importances saved → {fi_path}")
 
-        # 5d. Predict for ALL rows (labels + probs)
-        print("  Predicting for ALL rows (including originally missing labels)...")
+        # 5d. Predict for ALL rows (labels + probs) SAFELY
+        print("  Predicting for ALL rows...")
         y_all_pred = pipe.predict(X_full)
-        preds_labels[col + "_pred"] = y_all_pred
 
-        # Predict probabilities
+        # Sanity check
+        if len(y_all_pred) != n_rows:
+            raise RuntimeError(
+                f"Length mismatch for {col}: "
+                f"pred={len(y_all_pred)}, expected={n_rows}"
+            )
+
+        preds_labels_df[col + "_pred"] = pd.Series(
+            y_all_pred,
+            index=df.index
+        )
+
+        # Predict probabilities if available
         if hasattr(pipe.named_steps["clf"], "predict_proba"):
-            proba_all = pipe.predict_proba(X_full)  # shape: (n_samples, n_classes)
+            proba_all = pipe.predict_proba(X_full)
+            if proba_all.shape[0] != n_rows:
+                raise RuntimeError(
+                    f"Proba length mismatch for {col}: "
+                    f"proba={proba_all.shape[0]}, expected={n_rows}"
+                )
+
             classes = pipe.named_steps["clf"].classes_
 
             if len(classes) == 2:
-                # For binary, store probability of positive class only
                 pos_class = classes[1]
                 prob_col_name = f"{col}_proba_{pos_class}"
-                preds_probs[prob_col_name] = proba_all[:, 1]
+                preds_probs_df[prob_col_name] = pd.Series(
+                    proba_all[:, 1],
+                    index=df.index
+                )
             else:
-                # For multiclass, one column per class
                 for i, cls in enumerate(classes):
                     prob_col_name = f"{col}_proba_{cls}"
-                    preds_probs[prob_col_name] = proba_all[:, i]
+                    preds_probs_df[prob_col_name] = pd.Series(
+                        proba_all[:, i],
+                        index=df.index
+                    )
 
-        # Store summary
         per_target_results.append({
             "target": col,
             "n_labelled": n_labelled,
@@ -285,14 +299,13 @@ def main():
         })
 
     # -------------------------
-    # 6. Save per-target results (accuracy stats)
+    # 6. Save per-target results
     # -------------------------
     results_df = pd.DataFrame(per_target_results)
     results_df = results_df.sort_values("cv_mean_acc", ascending=True)
     results_df.to_csv("per_target_results_cv.csv", index=False)
     print("\nPer-target CV results saved → per_target_results_cv.csv")
 
-    # Min/max (excluding NaNs)
     valid = results_df["cv_mean_acc"].dropna()
     if not valid.empty:
         print(f"\nMin CV accuracy: {valid.min():.4f}")
@@ -305,10 +318,12 @@ def main():
     # -------------------------
     print("\nMerging predictions and probabilities back to original dataframe...")
 
-    preds_labels_df = pd.DataFrame(preds_labels, index=df.index)
-    preds_probs_df = pd.DataFrame(preds_probs, index=df.index)
+    # preds_probs_df might be empty if all models lacked predict_proba
+    parts = [df, preds_labels_df]
+    if not preds_probs_df.empty:
+        parts.append(preds_probs_df)
 
-    df_out = pd.concat([df, preds_labels_df, preds_probs_df], axis=1)
+    df_out = pd.concat(parts, axis=1)
     df_out.to_csv(OUTPUT_PATH, index=False)
 
     print(f"All predictions saved → {OUTPUT_PATH}")
