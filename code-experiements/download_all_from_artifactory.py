@@ -232,17 +232,29 @@ def main():
         train_acc_full = accuracy_score(y_lab, y_lab_pred)
         print(f"  Train accuracy on labelled rows: {train_acc_full:.4f}")
 
-        # 5c. Feature importances
+        # 5c. Feature importances (safe)
         clf = pipe.named_steps["clf"]
         pre_fitted = pipe.named_steps["pre"]
 
         feature_names = get_feature_names(pre_fitted, num_cols, cat_cols)
         importances = clf.feature_importances_
 
-        fi_df = pd.DataFrame({
-            "feature": feature_names,
-            "importance": importances,
-        }).sort_values("importance", ascending=False)
+        n_feat_names = len(feature_names)
+        n_importances = len(importances)
+
+        if n_feat_names != n_importances:
+            print(
+                f"  [WARN] Feature name / importance length mismatch for {col}: "
+                f"names={n_feat_names}, importances={n_importances}. "
+                "Truncating to the minimum length."
+            )
+            m = min(n_feat_names, n_importances)
+            feature_names = feature_names[:m]
+            importances = importances[:m]
+
+        fi_df = pd.DataFrame(
+            {"feature": feature_names, "importance": importances}
+        ).sort_values("importance", ascending=False)
 
         fi_path = f"feature_importances_{col}.csv"
         fi_df.to_csv(fi_path, index=False)
