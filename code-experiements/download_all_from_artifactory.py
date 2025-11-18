@@ -1,109 +1,215 @@
-# -------------------------------
-# Accuracy per target + summary
-# -------------------------------
-# Per-target accuracy
-hgb_acc_dict = accuracy_per_target(Y_val, hgb_preds)
+"""
+Multi-task classification with missing labels per target.
 
-# Convert to Series for easy stats
-acc_series = pd.Series(hgb_acc_dict)
+- Assumes a CSV with:
+    * Feature columns
+    * Label columns starting with 'y_'
+    * Optional ID column 'id_pwd_id'
+- Trains one HistGradientBoostingClassifier per target (handles missing labels by
+  training only on rows where that label is present).
+- Evaluates on a validation split.
+- Writes predictions back to a CSV alongside original data.
+"""
 
-mean_acc   = acc_series.mean()
-median_acc = acc_series.median()
-std_acc    = acc_series.std()
+import warnings
+warnings.filterwarnings("ignore")
 
-min_acc    = acc_series.min()
-max_acc    = acc_series.max()
-min_targets = acc_series[acc_series == min_acc].index.tolist()
-max_targets = acc_series[acc_series == max_acc].index.tolist()
+import numpy as np
+import pandas as pd
 
-print(f"[MultiOutput HGB] Mean per-target accuracy: {mean_acc:.4f}")
-print(f"[MultiOutput HGB] Median per-target accuracy: {median_acc:.4f}")
-print(f"[MultiOutput HGB] Std of per-target accuracy: {std_acc:.4f}")
-print(f"[MultiOutput HGB] Min accuracy: {min_acc:.4f} → {min_targets}")
-print(f"[MultiOutput HGB] Max accuracy: {max_acc:.4f} → {max_targets}")
-
-# -------------------------------
-# Build and save accuracy/F1 summary CSV
-# -------------------------------
-summary_df = pd.DataFrame({
-    "target": target_cols,
-    "macro_f1": [hgb_scores[c] for c in target_cols],
-    "accuracy": [hgb_acc_dict[c] for c in target_cols],
-})
-
-# Add global stats as an extra row (optional)
-summary_df.loc[len(summary_df)] = [
-    "<SUMMARY>",
-    summary_df["macro_f1"].mean(),
-    summary_df["accuracy"].mean(),
-]
-
-summary_path = OUTPUT_DIR / "validation_metrics_summary_hgb.csv"
-summary_df.to_csv(summary_path, index=False)
-print(f"[MultiOutput HGB] Metrics summary saved to: {summary_path}")
-
-# -------------------------------
-# Rank targets by difficulty
-# -------------------------------
-rank_df = pd.DataFrame({
-    "target": target_cols,
-    "accuracy": [hgb_acc_dict[c] for c in target_cols],
-    "macro_f1": [hgb_scores[c]   for c in target_cols],
-})
-
-# Sort by accuracy ascending (hardest first)
-rank_df = rank_df.sort_values("accuracy", ascending=True).reset_index(drop=True)
-
-# Show top 10 hardest targets in console
-print("\n=== Hardest targets (lowest accuracy) ===")
-print(rank_df.head(10))
-
-# Show top 10 easiest targets
-print("\n=== Easiest targets (highest accuracy) ===")
-print(rank_df.tail(10))
-
-# Save ranked list to CSV
-rank_path = OUTPUT_DIR / "targets_ranked_by_accuracy_hgb.csv"
-rank_df.to_csv(rank_path, index=False)
-print(f"\n[MultiOutput HGB] Ranked targets saved to: {rank_path}")
+from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 
-# ---------------------------------------------
-# Class distribution for the hardest targets
-# ---------------------------------------------
-num_hardest = 5   # change to 10 if you want more
+# =========================
+# CONFIG
+# =========================
+DATA_PATH = "input_data.csv"          # <-- change to your file path
+OUTPUT_PATH = "input_with_predictions.csv"
 
-hardest_targets = rank_df.head(num_hardest)["target"].tolist()
+TARGET_PREFIX = "y_"                  # label columns start with this
+MIN_LABELLED = 500                    # minimum labelled samples per target
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
 
-print("\n=== Class distributions for hardest targets ===")
-classdist_list = []   # for CSV export
 
-for col in hardest_targets:
-    print(f"\n--- {col} ---")
-    
-    # counts from validation set
-    value_counts = Y_val[col].value_counts(dropna=False)
-    value_perc   = Y_val[col].value_counts(normalize=True, dropna=False)
-    
-    # print nicely
-    print(pd.DataFrame({
-        "count": value_counts,
-        "percentage": value_perc
-    }))
-    
-    # store for CSV
-    temp_df = pd.DataFrame({
-        "target": col,
-        "class": value_counts.index,
-        "count": value_counts.values,
-        "percentage": value_perc.values,
-    })
-    classdist_list.append(temp_df)
+def main():
+    # -------------------------
+    # 1. Load data
+    # -------------------------
+    print(f"Loading data from: {DATA_PATH}")
+    df = pd.read_csv(DATA_PATH)
 
-# Combine & save CSV
-classdist_df = pd.concat(classdist_list, ignore_index=True)
+    n_rows, n_cols = df.shape
+    print(f"Data shape: {n_rows} rows x {n_cols} columns")
 
-dist_path = OUTPUT_DIR / "class_distributions_hardest_targets.csv"
-classdist_df.to_csv(dist_path, index=False)
+    # Optional ID column (will be kept & used only for merge / inspection)
+    id_col = "id_pwd_id" if "id_pwd_id" in df.columns else None
+    if id_col:
+        print(f"Detected ID column: {id_col}")
 
-print(f"\n[MultiOutput HGB] Class distribution summary saved to: {dist_path}")
+    # -------------------------
+    # 2. Identify label & feature columns
+    # -------------------------
+    target_cols = [c for c in df.columns if c.startswith(TARGET_PREFIX)]
+
+    if not target_cols:
+        raise ValueError(f"No columns start with prefix '{TARGET_PREFIX}'.")
+
+    print(f"Detected {len(target_cols)} target columns with prefix '{TARGET_PREFIX}'.")
+
+    feature_cols = [c for c in df.columns if c not in target_cols]
+    X = df[feature_cols].copy()
+    Y = df[target_cols].copy()
+
+    # -------------------------
+    # 3. Filter targets by minimum labelled samples
+    # -------------------------
+    label_counts = Y.notna().sum().to_frame("n_labelled")
+    label_counts["total"] = len(df)
+    label_counts["n_missing"] = label_counts["total"] - label_counts["n_labelled"]
+    label_counts["frac_missing"] = label_counts["n_missing"] / label_counts["total"]
+
+    print("\nLabelled count per target (head):")
+    print(label_counts.sort_values("n_labelled").head(10))
+
+    good_targets = [
+        col for col in target_cols
+        if Y[col].notna().sum() >= MIN_LABELLED
+    ]
+    bad_targets = sorted(set(target_cols) - set(good_targets))
+
+    print(f"\nTargets kept (>= {MIN_LABELLED} labelled): {len(good_targets)}")
+    print(f"Targets dropped (< {MIN_LABELLED} labelled): {len(bad_targets)}")
+    if bad_targets:
+        print("Example dropped targets:", bad_targets[:10])
+
+    if not good_targets:
+        raise ValueError(
+            f"No targets have at least {MIN_LABELLED} labelled samples. "
+            "Lower MIN_LABELLED and retry."
+        )
+
+    Y_good = Y[good_targets].copy()
+
+    # -------------------------
+    # 4. Train/validation split
+    # -------------------------
+    X_train, X_val, Y_train, Y_val = train_test_split(
+        X, Y_good, test_size=TEST_SIZE, random_state=RANDOM_STATE
+    )
+
+    print(f"\nTrain size: {len(X_train)} rows")
+    print(f"Validation size: {len(X_val)} rows")
+
+    # -------------------------
+    # 5. Train one model per target
+    # -------------------------
+    models = {}
+    accs = {}
+
+    print("\nTraining models per target...")
+    for col in good_targets:
+        y_train_col = Y_train[col]
+
+        # Use only rows where this target is labelled
+        mask_train = ~y_train_col.isna()
+        n_train_labelled = mask_train.sum()
+
+        # Skip if not enough labelled data in TRAIN split
+        if n_train_labelled < max(100, MIN_LABELLED // 3):
+            print(
+                f"  [SKIP] {col}: only {n_train_labelled} labelled rows in train "
+                f"(< {max(100, MIN_LABELLED // 3)})"
+            )
+            accs[col] = np.nan
+            continue
+
+        # Need at least 2 classes
+        unique_classes = y_train_col[mask_train].unique()
+        if len(unique_classes) < 2:
+            print(
+                f"  [SKIP] {col}: only one class present in train "
+                f"({unique_classes})"
+            )
+            accs[col] = np.nan
+            continue
+
+        clf = HistGradientBoostingClassifier(
+            learning_rate=0.06,
+            max_depth=None,
+            max_bins=255,
+            l2_regularization=0.0,
+            early_stopping=True,
+            random_state=RANDOM_STATE,
+        )
+
+        clf.fit(X_train[mask_train], y_train_col[mask_train])
+        models[col] = clf
+
+        # Validation accuracy: only rows where target is labelled in val
+        y_val_col = Y_val[col]
+        mask_val = ~y_val_col.isna()
+
+        if mask_val.sum() == 0:
+            print(f"  [NO VAL LABELS] {col}: accuracy set to NaN")
+            accs[col] = np.nan
+            continue
+
+        y_val_true = y_val_col[mask_val]
+        y_val_pred = clf.predict(X_val[mask_val])
+
+        acc = accuracy_score(y_val_true, y_val_pred)
+        accs[col] = acc
+
+        print(f"  [OK] {col}: train_labelled={n_train_labelled}, "
+              f"val_labelled={mask_val.sum()}, accuracy={acc:.4f}")
+
+    # -------------------------
+    # 6. Accuracy summary: per target + min/max
+    # -------------------------
+    accs_series = pd.Series(accs, name="accuracy")
+    accs_df = accs_series.to_frame().sort_values("accuracy")
+
+    print("\nPer-target validation accuracy (sorted):")
+    print(accs_df)
+
+    # Exclude NaN when computing min/max
+    valid_accs = accs_series.dropna()
+    if not valid_accs.empty:
+        min_acc = valid_accs.min()
+        max_acc = valid_accs.max()
+        print(f"\nMin validation accuracy: {min_acc:.4f}")
+        print(f"Max validation accuracy: {max_acc:.4f}")
+    else:
+        print("\nNo valid accuracies (all NaN). Check your data/thresholds.")
+
+    # Optionally save accuracies
+    accs_df.to_csv("per_target_accuracy.csv", index=True)
+    print("Per-target accuracies saved to: per_target_accuracy.csv")
+
+    # -------------------------
+    # 7. Predict for ALL rows and merge back into original df
+    # -------------------------
+    print("\nPredicting labels for ALL rows and merging with input data...")
+
+    # We'll use the models trained on the train split (no refit on full data)
+    # and predict for ALL X.
+    preds = {}
+    for col, clf in models.items():
+        preds[col + "_pred"] = clf.predict(X)
+
+    preds_df = pd.DataFrame(preds, index=df.index)
+
+    # Merge predictions with original data
+    df_with_preds = pd.concat([df, preds_df], axis=1)
+
+    # Save to CSV
+    df_with_preds.to_csv(OUTPUT_PATH, index=False)
+    print(f"Full data with predictions saved to: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
