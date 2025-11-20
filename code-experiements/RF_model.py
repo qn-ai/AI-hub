@@ -137,8 +137,49 @@ def main():
             f"{base_name}_confidence_metric1": conf_all
         })
 
-        # merge into result table
+        # merge into result table (columns will be reordered later)
         result_table = pd.concat([result_table, preds_df], axis=1)
+
+    # -------------------------------------------------
+    # Reorder columns
+    #   id_pwd_id first (if exists), then other id_ cols,
+    #   then for each y_:
+    #     y,
+    #     y_interpolated_model1,
+    #     y_interpolated_model1_confidence_metric1 (if they exist)
+    # -------------------------------------------------
+    col_order = []
+
+    # 1) id_pwd_id first if present
+    if "id_pwd_id" in result_table.columns:
+        col_order.append("id_pwd_id")
+
+    # 2) other id_ columns (excluding id_pwd_id if already added)
+    for c in id_cols:
+        if c == "id_pwd_id":
+            continue
+        if c in result_table.columns and c not in col_order:
+            col_order.append(c)
+
+    # 3) for each y_ column: y, y_interpolated_model1, y_interpolated_model1_confidence_metric1
+    for y_col in y_cols:
+        # original target
+        if y_col in result_table.columns:
+            col_order.append(y_col)
+
+        base_name = f"{y_col}_interpolated_model1"
+        conf_name = f"{base_name}_confidence_metric1"
+
+        if base_name in result_table.columns:
+            col_order.append(base_name)
+        if conf_name in result_table.columns:
+            col_order.append(conf_name)
+
+    # Keep only columns that actually exist
+    col_order = [c for c in col_order if c in result_table.columns]
+
+    # Finally reorder
+    result_table = result_table[col_order]
 
     # -------------------------------------------------
     # Save final table
