@@ -2,137 +2,72 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import time
-
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold, cross_val_score
 
 # =====================================================
 DATA_PATH = "input_data.csv"
 OUT_PATH = "output_interpolated_model1.csv"
 
-MIN_LABELS = 200               # minimum labelled rows per target
-IMBALANCE_THRESHOLD = 0.80     # for info only; not mandatory to use
-FOLD_CANDIDATES = [3, 5, 10]   # candidate CV folds (optional – for logging)
-N_JOBS = -1                    # parallelism for joblib
+MIN_LABELS = 200          # minimum labelled rows per target
+ROW_CHUNK_SIZE = 50000    # how many rows per prediction batch
+RANDOM_STATE = 42
 # =====================================================
 
 
 def train_rf_model(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifier:
-    """Instantiate and return a RandomForest model."""
+    """Instantiate and train a RandomForest model."""
     model = RandomForestClassifier(
         n_estimators=300,
-        random_state=42,
-        n_jobs=-1
-        # you can add class_weight="balanced" if you want
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        # class_weight="balanced"  # uncomment if you want imbalance handling
     )
+    model.fit(X, y)
     return model
 
 
-def process_target(df: pd.DataFrame,
-                   target: str,
-                   ft_cols: list[str]):
+def predict_in_row_chunks(
+    model: RandomForestClassifier,
+    X_full: pd.DataFrame,
+    is_binary: bool,
+    row_chunk_size: int = ROW_CHUNK_SIZE
+):
     """
-    Train RF for a single target and return a DataFrame with:
-      - y_<target>_interpolated_model1
-      - y_<target>_interpolated_model1_confidence_metric1
+    Predict labels + confidence in row chunks to reduce memory & avoid timeouts.
+
+    Returns:
+        y_pred_all: np.ndarray of shape (n_rows,)
+        conf_all:   np.ndarray of shape (n_rows,)
     """
-    print(f"\n=== Random Forest | Target {target} ===")
+    n = len(X_full)
+    all_pred = []
+    all_conf = []
 
-    # labelled rows only
-    mask = df[target].notna()
-    y = df.loc[mask, target]
+    for start in range(0, n, row_chunk_size):
+        end = min(start + row_chunk_size, n)
+        X_batch = X_full.iloc[start:end]
 
-    # skip if not enough labels or only one class
-    if y.nunique() < 2 or len(y) < MIN_LABELS:
-        print(f"  [SKIP] {target}: n_labelled={len(y)}, "
-              f"n_classes={y.nunique()}")
-        return None
+        y_pred_batch = model.predict(X_batch)
+        proba_batch = model.predict_proba(X_batch)
 
-    # features
-    X_raw = df.loc[mask, ft_cols]
-    X_full_raw = df[ft_cols]
-
-    # one-hot encode all features
-    X = pd.get_dummies(X_raw, dummy_na=True)
-    X_full = pd.get_dummies(X_full_raw, dummy_na=True)
-    X_full = X_full.reindex(columns=X.columns, fill_value=0)
-
-    # optional: detect imbalance (for logging)
-    class_dist = y.value_counts(normalize=True)
-    maj_prop = class_dist.max()
-    is_imbalanced = maj_prop >= IMBALANCE_THRESHOLD
-    print(f"  Imbalanced: {is_imbalanced} "
-          f"(majority={maj_prop:.3f})")
-
-    # -------------------------------------------------
-    # OPTIONAL: choose best CV folds (just for info)
-    # -------------------------------------------------
-    fold_scores = {}
-    for k in FOLD_CANDIDATES:
-        if len(y) < k:
-            continue
-
-        model_temp = train_rf_model(X, y)
-        cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
-        scores = cross_val_score(
-            model_temp, X, y, cv=cv,
-            scoring="accuracy", n_jobs=-1
-        )
-        fold_scores[k] = (scores.mean(), scores.std())
-
-    if fold_scores:
-        best_k = max(fold_scores, key=lambda kk: fold_scores[kk][0])
-        best_cv_mean, best_cv_std = fold_scores[best_k]
-        print(f"  Best CV folds: {best_k} "
-              f"(acc={best_cv_mean:.4f}, std={best_cv_std:.4f})")
-    else:
-        print("  Not enough samples for any CV folds.")
-
-    # -------------------------------------------------
-    # Train final RF on *all* labelled rows
-    # -------------------------------------------------
-    model = train_rf_model(X, y)
-
-    t0 = time.time()
-    model.fit(X, y)
-    training_time = time.time() - t0
-    print(f"  Training time: {training_time:.2f} sec")
-
-    # basic train metrics (for monitoring, not used later)
-    y_train_pred = model.predict(X)
-    acc_train = accuracy_score(y, y_train_pred)
-    f1_train = f1_score(y, y_train_pred, average="macro")
-    print(f"  Train accuracy: {acc_train:.4f}, macro F1: {f1_train:.4f}")
-
-    # -------------------------------------------------
-    # Predict for ALL rows (including unlabelled)
-    # -------------------------------------------------
-    y_pred_all = model.predict(X_full)
-
-    if hasattr(model, "predict_proba"):
-        y_proba_all = model.predict_proba(X_full)
-
-        # confidence = prob of positive class for binary,
-        # otherwise the max class probability
-        if y.nunique() == 2:
-            conf_all = y_proba_all[:, 1]
+        if is_binary:
+            # prob of class 1
+            conf_batch = proba_batch[:, 1]
         else:
-            conf_all = y_proba_all.max(axis=1)
-    else:
-        conf_all = np.ones(len(X_full)) * np.nan
+            # max prob among classes
+            conf_batch = proba_batch.max(axis=1)
 
-    base_name = f"{target}_interpolated_model1"
-    preds_df = pd.DataFrame({
-        base_name: y_pred_all,
-        f"{base_name}_confidence_metric1": conf_all
-    })
+        all_pred.append(y_pred_batch)
+        all_conf.append(conf_batch)
 
-    return preds_df
+        print(f"    Predicted rows {start}–{end-1}")
+
+    y_pred_all = np.concatenate(all_pred)
+    conf_all = np.concatenate(all_conf)
+    return y_pred_all, conf_all
 
 
 def main():
@@ -148,24 +83,61 @@ def main():
     print(f"Loaded: {DATA_PATH}")
     print(f"Rows: {len(df)}")
     print(f"ID cols: {id_cols}")
-    print(f"Feature cols (ft_): {len(ft_cols)}")
-    print(f"Target cols (y_): {len(y_cols)}")
+    print(f"# Feature cols (ft_): {len(ft_cols)}")
+    print(f"# Target cols (y_): {len(y_cols)}")
 
-    # start result table with IDs + original targets
+    # -------------------------------------------------
+    # Encode all features ONCE (for all targets)
+    # -------------------------------------------------
+    print("\nEncoding features with get_dummies (once)...")
+    X_full_raw = df[ft_cols]
+    X_full = pd.get_dummies(X_full_raw, dummy_na=True)
+    print(f"  Encoded feature shape: {X_full.shape}")
+
+    # -------------------------------------------------
+    # Start result table with IDs + original targets
+    # -------------------------------------------------
     result_table = df[id_cols + y_cols].copy()
 
     # -------------------------------------------------
-    # Process each target in parallel
+    # Process each target sequentially
     # -------------------------------------------------
-    processed_list = Parallel(n_jobs=N_JOBS)(
-        delayed(process_target)(df, target, ft_cols)
-        for target in y_cols
-    )
+    for target in y_cols:
+        print(f"\n=== Random Forest | Target {target} ===")
 
-    # add prediction columns
-    for preds_df in processed_list:
-        if preds_df is None:
+        mask = df[target].notna()
+        y = df.loc[mask, target]
+
+        # skip if not enough labels or only one class
+        if y.nunique() < 2 or len(y) < MIN_LABELS:
+            print(f"  [SKIP] {target}: n_labelled={len(y)}, "
+                  f"n_classes={y.nunique()}")
             continue
+
+        # labelled subset of encoded features
+        X = X_full.loc[mask]
+        print(f"  n_labelled: {len(y)}, n_classes: {y.nunique()}")
+
+        # ---- train RF ----
+        t0 = time.time()
+        model = train_rf_model(X, y)
+        training_time = time.time() - t0
+        print(f"  Training time: {training_time:.2f} sec")
+
+        # ---- predict for ALL rows in chunks ----
+        is_binary = (y.nunique() == 2)
+        print("  Predicting for all rows in chunks...")
+        y_pred_all, conf_all = predict_in_row_chunks(
+            model, X_full, is_binary, ROW_CHUNK_SIZE
+        )
+
+        base_name = f"{target}_interpolated_model1"
+        preds_df = pd.DataFrame({
+            base_name: y_pred_all,
+            f"{base_name}_confidence_metric1": conf_all
+        })
+
+        # merge into result table
         result_table = pd.concat([result_table, preds_df], axis=1)
 
     # -------------------------------------------------
