@@ -1,37 +1,52 @@
 # model_training.py
+from __future__ import annotations
+
 import json
+from typing import Dict
+
 import numpy as np
 import pandas as pd
-
-from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, cross_validate
+import mlflow
+import mlflow.catboost
+import mlflow.lightgbm
+import mlflow.sklearn
 from sklearn.metrics import (
     accuracy_score,
+    classification_report,
+    confusion_matrix,
     f1_score,
+    log_loss,
     precision_score,
     recall_score,
     roc_auc_score,
-    log_loss,
-    classification_report,
-    confusion_matrix,
 )
+from sklearn.model_selection import (
+    RandomizedSearchCV,
+    StratifiedKFold,
+    cross_validate,
+)
+from sklearn.pipeline import Pipeline
 
-import mlflow
-import mlflow.sklearn
-import mlflow.lightgbm
-import mlflow.catboost
-
-from config import RANDOM_STATE, N_JOBS, N_OUTER_FOLDS
+from config import N_JOBS, N_OUTER_FOLDS, RANDOM_STATE
 from data_preprocessing import (
     build_sklearn_preprocessor,
     detect_feature_types,
     get_catboost_cat_indices,
+    train_val_split_for_target,
 )
 
 
-# -----------------------------
-# HELPER: evaluation on hold-out
-# -----------------------------
-def evaluate_holdout(model, X_val, y_val, model_name, target_name):
+def evaluate_holdout(
+    model,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    model_name: str,
+    target_name: str,
+) -> tuple[Dict[str, float], np.ndarray, str]:
+    """
+    Compute metrics on a hold-out validation set.
+    Metric keys are prefixed with val_{target}_{model}_.
+    """
     y_pred = model.predict(X_val)
 
     if hasattr(model, "predict_proba"):
@@ -41,40 +56,63 @@ def evaluate_holdout(model, X_val, y_val, model_name, target_name):
         y_proba = None
         has_proba = False
 
-    metrics = {}
     prefix = f"val_{target_name}_{model_name}_"
+    metrics: Dict[str, float] = {}
 
-    metrics[prefix + "accuracy"] = accuracy_score(y_val, y_pred)
-    metrics[prefix + "f1_macro"] = f1_score(y_val, y_pred, average="macro")
-    metrics[prefix + "f1_weighted"] = f1_score(y_val, y_pred, average="weighted")
-    metrics[prefix + "precision_macro"] = precision_score(
-        y_val, y_pred, average="macro", zero_division=0
+    metrics[f"{prefix}accuracy"] = accuracy_score(y_val, y_pred)
+    metrics[f"{prefix}f1_macro"] = f1_score(
+        y_val,
+        y_pred,
+        average="macro",
     )
-    metrics[prefix + "precision_weighted"] = precision_score(
-        y_val, y_pred, average="weighted", zero_division=0
+    metrics[f"{prefix}f1_weighted"] = f1_score(
+        y_val,
+        y_pred,
+        average="weighted",
     )
-    metrics[prefix + "recall_macro"] = recall_score(
-        y_val, y_pred, average="macro", zero_division=0
+    metrics[f"{prefix}precision_macro"] = precision_score(
+        y_val,
+        y_pred,
+        average="macro",
+        zero_division=0,
     )
-    metrics[prefix + "recall_weighted"] = recall_score(
-        y_val, y_pred, average="weighted", zero_division=0
+    metrics[f"{prefix}precision_weighted"] = precision_score(
+        y_val,
+        y_pred,
+        average="weighted",
+        zero_division=0,
+    )
+    metrics[f"{prefix}recall_macro"] = recall_score(
+        y_val,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+    metrics[f"{prefix}recall_weighted"] = recall_score(
+        y_val,
+        y_pred,
+        average="weighted",
+        zero_division=0,
     )
 
     if has_proba:
         try:
-            metrics[prefix + "roc_auc_ovr"] = roc_auc_score(
-                y_val, y_proba, multi_class="ovr", average="macro"
+            metrics[f"{prefix}roc_auc_ovr"] = roc_auc_score(
+                y_val,
+                y_proba,
+                multi_class="ovr",
+                average="macro",
             )
         except Exception:
-            metrics[prefix + "roc_auc_ovr"] = np.nan
+            metrics[f"{prefix}roc_auc_ovr"] = np.nan
 
         try:
-            metrics[prefix + "log_loss"] = log_loss(y_val, y_proba)
+            metrics[f"{prefix}log_loss"] = log_loss(y_val, y_proba)
         except Exception:
-            metrics[prefix + "log_loss"] = np.nan
+            metrics[f"{prefix}log_loss"] = np.nan
     else:
-        metrics[prefix + "roc_auc_ovr"] = np.nan
-        metrics[prefix + "log_loss"] = np.nan
+        metrics[f"{prefix}roc_auc_ovr"] = np.nan
+        metrics[f"{prefix}log_loss"] = np.nan
 
     cm = confusion_matrix(y_val, y_pred)
     report = classification_report(y_val, y_pred)
@@ -82,12 +120,22 @@ def evaluate_holdout(model, X_val, y_val, model_name, target_name):
     return metrics, cm, report
 
 
-# -----------------------------
-# HELPER: cross-validation
-# -----------------------------
-def evaluate_cv(model, X, y, model_name, target_name, n_folds=N_OUTER_FOLDS):
+def evaluate_cv(
+    model,
+    X: pd.DataFrame,
+    y: pd.Series,
+    model_name: str,
+    target_name: str,
+    n_folds: int = N_OUTER_FOLDS,
+) -> Dict[str, float]:
+    """
+    Run k-fold cross-validation and return mean/std metrics.
+    Metric keys are prefixed with cv_{target}_{model}_.
+    """
     cv = StratifiedKFold(
-        n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE
+        n_splits=n_folds,
+        shuffle=True,
+        random_state=RANDOM_STATE,
     )
 
     scoring = {
@@ -110,71 +158,61 @@ def evaluate_cv(model, X, y, model_name, target_name, n_folds=N_OUTER_FOLDS):
         return_train_score=False,
     )
 
-    metrics_cv = {}
+    metrics_cv: Dict[str, float] = {}
     prefix = f"cv_{target_name}_{model_name}_"
+
     for key, values in cv_results.items():
-        if key.startswith("test_"):
-            metric_name = key.replace("test_", "")
-            metrics_cv[prefix + metric_name + "_mean"] = np.mean(values)
-            metrics_cv[prefix + metric_name + "_std"] = np.std(values)
+        if not key.startswith("test_"):
+            continue
+        metric_name = key.replace("test_", "")
+        metrics_cv[f"{prefix}{metric_name}_mean"] = float(np.mean(values))
+        metrics_cv[f"{prefix}{metric_name}_std"] = float(np.std(values))
 
     return metrics_cv
 
 
-# -----------------------------
-# MAIN: tune and train for one target & model
-# -----------------------------
 def tune_and_train_one_model_for_target(
-    model_name,
+    model_name: str,
     base_estimator,
-    param_distributions,
-    df,
-    X_full,
-    target_col,
-):
+    param_distributions: dict,
+    df: pd.DataFrame,
+    X_full: pd.DataFrame,
+    target_col: str,
+) -> dict:
     """
     For one target + one model:
-      - build appropriate preprocessing
-      - tune hyperparameters (RandomizedSearchCV)
-      - evaluate hold-out and CV
-      - log to MLflow
-      - return metrics row for CSV
+      - train/val split (dropping missing labels)
+      - hyperparameter tuning via RandomizedSearchCV
+      - hold-out & CV evaluation
+      - MLflow logging
+      - return a flat dict of metrics/params for CSV.
     """
-
-    from data_preprocessing import train_val_split_for_target
-
-    # Split train/val for this target (drop missing labels)
     X_train_raw, X_val_raw, y_train, y_val, label_encoder = train_val_split_for_target(
-        df, X_full, target_col
+        df,
+        X_full,
+        target_col,
     )
 
-    # Build preprocessors
-    preprocessor_sklearn, numeric_cols, cat_cols = build_sklearn_preprocessor(X_full)
+    preprocessor_sklearn, _, cat_cols = build_sklearn_preprocessor(X_full)
     cat_indices = get_catboost_cat_indices(X_full, cat_cols)
 
-    # For RF & LGBM: use sklearn preprocessor -> pipeline
     if model_name in ("RandomForest", "LightGBM"):
-        from sklearn.pipeline import Pipeline
-
         estimator = base_estimator
         pipe = Pipeline(
             steps=[
                 ("preprocessor", preprocessor_sklearn),
                 ("model", estimator),
-            ]
+            ],
         )
         search_estimator = pipe
         param_dist_with_prefix = {
-            "model__" + k: v for k, v in param_distributions.items()
+            f"model__{k}": v for k, v in param_distributions.items()
         }
+        fit_params = {}
     else:
-        # CatBoost: use raw X, handle categorical indices directly.
-        # We'll still impute missing numeric values if you want,
-        # but CatBoost can handle missing values in many cases.
         search_estimator = base_estimator
         param_dist_with_prefix = param_distributions
-
-    from config import RANDOM_STATE
+        fit_params = {"cat_features": cat_indices}
 
     search = RandomizedSearchCV(
         estimator=search_estimator,
@@ -188,60 +226,52 @@ def tune_and_train_one_model_for_target(
         refit=True,
     )
 
-    # Fit search
-    if model_name in ("RandomForest", "LightGBM"):
-        search.fit(X_train_raw, y_train)
-        best_model = search.best_estimator_
-    else:
-        # CatBoost needs cat_features indices
-        cat_feat_idx = cat_indices
-        search.fit(X_train_raw, y_train, model__cat_features=cat_feat_idx) if False else \
-            search.fit(X_train_raw, y_train, cat_features=cat_feat_idx)
-        best_model = search.best_estimator_
-
+    search.fit(X_train_raw, y_train, **fit_params)
+    best_model = search.best_estimator_
     best_params = search.best_params_
 
-    # Hold-out metrics
     val_metrics, cm, report = evaluate_holdout(
-        best_model, X_val_raw, y_val, model_name, target_col
+        best_model,
+        X_val_raw,
+        y_val,
+        model_name,
+        target_col,
     )
 
-    # CV metrics on all non-missing rows for this target
-    mask = df[target_col].notna()
-    X_all_target = X_full.loc[mask]
-    y_all_target = df[target_col].loc[mask]
+    mask_all = df[target_col].notna()
+    X_all_target = X_full.loc[mask_all]
+    y_all_target = df[target_col].loc[mask_all]
+
     if label_encoder is not None and y_all_target.dtype == "object":
         y_all_target = label_encoder.transform(y_all_target)
 
     cv_metrics = evaluate_cv(
-        best_model, X_all_target, y_all_target, model_name, target_col
+        best_model,
+        X_all_target,
+        y_all_target,
+        model_name,
+        target_col,
     )
 
-    # -------------------------
-    # MLflow logging
-    # -------------------------
     run_name = f"{target_col}_{model_name}"
     with mlflow.start_run(run_name=run_name):
         mlflow.log_param("model_name", model_name)
         mlflow.log_param("target_col", target_col)
         mlflow.log_params(best_params)
 
-        # metrics
         mlflow.log_metrics(val_metrics)
         mlflow.log_metrics(cv_metrics)
 
-        # confusion matrix & classification report
         cm_df = pd.DataFrame(cm)
         cm_path = f"cm_{target_col}_{model_name}.csv"
         cm_df.to_csv(cm_path, index=False)
         mlflow.log_artifact(cm_path)
 
         report_path = f"classification_report_{target_col}_{model_name}.txt"
-        with open(report_path, "w") as f:
+        with open(report_path, "w", encoding="utf-8") as f:
             f.write(report)
         mlflow.log_artifact(report_path)
 
-        # Log model
         if model_name == "RandomForest":
             mlflow.sklearn.log_model(best_model, artifact_path="model")
         elif model_name == "LightGBM":
@@ -251,8 +281,7 @@ def tune_and_train_one_model_for_target(
         else:
             mlflow.sklearn.log_model(best_model, artifact_path="model")
 
-    # Build a flat metrics row
-    row = {
+    row: dict = {
         "target": target_col,
         "model": model_name,
         "best_params": json.dumps(best_params),
