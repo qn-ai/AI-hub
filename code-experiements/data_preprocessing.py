@@ -11,40 +11,21 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
 
-from config import RANDOM_STATE, TEST_SIZE
+from config import DATA_PATH, RANDOM_STATE, TEST_SIZE
 
 
 def load_data() -> pd.DataFrame:
     """
-    Placeholder data loader.
+    Load your real data from CSV.
 
-    TODO: Replace with your real data loading logic.
-    Currently:
-      - creates synthetic features ft_*
-      - synthetic multi-target columns y_main, y_alt1, y_alt2
-      - injects some missing values.
+    Expects:
+      - feature columns starting with 'ft_'
+      - target columns starting with 'y_'
+      - id column 'id_pwd_id' (and optionally other 'id_' columns)
+
+    Adjust DATA_PATH in config.py if needed.
     """
-    from sklearn.datasets import make_classification
-
-    X, y_main = make_classification(
-        n_samples=5000,
-        n_features=20,
-        n_informative=10,
-        n_redundant=5,
-        n_classes=5,
-        random_state=RANDOM_STATE,
-    )
-
-    df = pd.DataFrame(X, columns=[f"ft_{i}" for i in range(X.shape[1])])
-    df["y_main"] = y_main
-    df["y_alt1"] = (y_main + 1) % 5
-    df["y_alt2"] = (y_main + 2) % 5
-
-    rng = np.random.default_rng(RANDOM_STATE)
-    for col in df.columns:
-        mask = rng.random(df.shape[0]) < 0.05
-        df.loc[mask, col] = np.nan
-
+    df = pd.read_csv(DATA_PATH)
     return df
 
 
@@ -58,23 +39,35 @@ def split_features_targets(
     Split dataframe into features X, target columns, and id columns.
 
     Targets:
-      - if explicit_targets is given, use that
-      - else, use all columns starting with target_prefix
-        (with a fallback for synthetic y_main, y_alt1, y_alt2).
+      - all columns starting with target_prefix (e.g. 'y_'),
+        unless explicit_targets is provided.
 
     Features:
-      - all columns except targets and id_ columns.
+      - all columns starting with 'ft_'.
+
+    IDs:
+      - all columns starting with id_prefix (e.g. 'id_')
+      - plus 'id_pwd_id' explicitly if present.
     """
+    # --- Targets ---
     if explicit_targets is not None:
         target_cols = explicit_targets
     else:
         target_cols = [c for c in df.columns if c.startswith(target_prefix)]
         if not target_cols:
-            candidate = ["y_main", "y_alt1", "y_alt2"]
-            target_cols = [c for c in candidate if c in df.columns]
+            raise ValueError(
+                f"No target columns found with prefix '{target_prefix}'.",
+            )
 
+    # --- ID columns ---
     id_cols = [c for c in df.columns if c.startswith(id_prefix)]
-    feature_cols = [c for c in df.columns if c not in target_cols + id_cols]
+    if "id_pwd_id" in df.columns and "id_pwd_id" not in id_cols:
+        id_cols.append("id_pwd_id")
+
+    # --- Feature columns ---
+    feature_cols = [c for c in df.columns if c.startswith("ft_")]
+    if not feature_cols:
+        raise ValueError("No feature columns found with prefix 'ft_'.")
 
     X = df[feature_cols].copy()
     return X, target_cols, id_cols
