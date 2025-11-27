@@ -6,6 +6,10 @@ from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 
+# ---- Paths ----
+DATA_PATH = "input_data.csv"  # <- change if your file is elsewhere
+
+# ---- General settings ----
 RANDOM_STATE = 42
 N_JOBS = -1
 TEST_SIZE = 0.2
