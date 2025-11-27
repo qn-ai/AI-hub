@@ -1,49 +1,44 @@
 # config.py
-import os
+from __future__ import annotations
+
 import mlflow
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier
 
 RANDOM_STATE = 42
 N_JOBS = -1
 TEST_SIZE = 0.2
-N_OUTER_FOLDS = 5  # CV folds after tuning
+N_OUTER_FOLDS = 5
+
 EXPERIMENT_NAME = "multitarget_rf_lgbm_catboost"
 
-# Path for local results
 RESULTS_CSV_PATH = "multitarget_model_comparison_results.csv"
 AGG_PLOT_PATH = "multitarget_model_comparison_plot.png"
 
-# -----------------------------
-# MLflow configuration
-# -----------------------------
-def setup_mlflow():
+
+def setup_mlflow() -> None:
     """
     Configure MLflow tracking.
-    - Tracking URI (local file-based by default)
-    - You can point this to a remote server whose artifact root is S3.
+
+    By default:
+      - local tracking in ./mlruns
+
+    If you have a remote MLflow server with S3 artifact root, you can change
+    the tracking URI here, e.g.:
+
+        mlflow.set_tracking_uri("http://your-mlflow-server:5000")
     """
-
-    # Example A: local tracking (models saved locally via MLflow)
     mlflow.set_tracking_uri("file:./mlruns")
-
-    # Example B (commented): remote MLflow server with S3 artifact root
-    # mlflow.set_tracking_uri("http://your-mlflow-server:5000")
-    # Then start server with:
-    #   mlflow server \
-    #     --backend-store-uri sqlite:///mlflow.db \
-    #     --default-artifact-root s3://your-bucket/path
-
     mlflow.set_experiment(EXPERIMENT_NAME)
 
 
-# -----------------------------
-# Model spaces (hyperparameters)
-# -----------------------------
-from sklearn.ensemble import RandomForestClassifier
-from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
-
-def get_models_and_spaces():
-    models_and_spaces = {
+def get_models_and_spaces() -> dict:
+    """
+    Return model definitions and hyperparameter search spaces for
+    RandomForest, LightGBM, and CatBoost.
+    """
+    models_and_spaces: dict = {
         "RandomForest": {
             "estimator": RandomForestClassifier(
                 random_state=RANDOM_STATE,
