@@ -15,6 +15,7 @@ Pipeline:
     * drop highly-correlated numeric columns.
 - For each target column (y_*) with enough non-missing rows:
     * subset rows where this y_ is not missing,
+    * label-encode the target if it is non-numeric (for XGBoost etc.),
     * encode categoricals with CatBoostEncoder (no rare-category combining),
     * train RandomForest, LightGBM, CatBoost, and XGBoost,
     * compute feature importances for that target,
@@ -42,6 +43,7 @@ from category_encoders import CatBoostEncoder
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import VarianceThreshold
+from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
 # =====================================================================
@@ -204,7 +206,7 @@ def get_xgb_importance(X: pd.DataFrame, y: pd.Series) -> pd.Series:
 
     Args:
         X: Encoded feature matrix (all numeric).
-        y: Target series.
+        y: Target series (numeric / label-encoded).
 
     Returns:
         A pandas Series of normalized feature importances indexed by column
@@ -251,7 +253,7 @@ def compute_model_importances_for_target(
             Encoded feature matrix (numeric) for RandomForest, LightGBM,
             and XGBoost.
         y:
-            Target series for the current y_ column.
+            Target series for the current y_ column (numeric / label-encoded).
         original_X_for_cb:
             Original (non-encoded) feature matrix after basic cleanup
             for CatBoost.
@@ -390,7 +392,19 @@ def main() -> None:
 
         logging.info("Processing target: %s (rows with label: %d)", y_col, n_rows)
 
-        y = df_target[y_col]
+        y_raw = df_target[y_col]
+
+        # Label-encode y if it is non-numeric (e.g., string classes).
+        if not np.issubdtype(y_raw.dtype, np.number):
+            logging.info("Label-encoding non-numeric target for %s", y_col)
+            le = LabelEncoder()
+            y = pd.Series(
+                le.fit_transform(y_raw.astype(str)),
+                index=y_raw.index,
+            )
+        else:
+            y = y_raw
+
         # Align features with these rows using the cleaned X.
         X_subset = X_clean.loc[df_target.index].copy()
 
