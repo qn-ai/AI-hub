@@ -18,13 +18,18 @@ Pipeline:
     * per-target: drop ft_ columns with > MISSING_THRESH missing
       (based only on rows available for that target),
     * label-encode the target if it is non-numeric,
-    * encode categoricals with CatBoostEncoder (no rare-category combining),
+    * treat ALL object columns as categorical,
+    * encode categoricals with CatBoostEncoder (no rare-category combining)
+      for RF / LGBM / XGB,
     * coerce all encoded features to numeric (but DO NOT fill NaNs),
+    * for CatBoost:
+        - use original features,
+        - convert categorical columns to string and fill NaNs with "NA_CAT",
     * train:
         - RandomForest (sklearn>=1.4, NaN-aware),
         - LightGBM (NaN-aware),
         - XGBoost (NaN-aware),
-        - CatBoost (NaN-aware, native categorical handling),
+        - CatBoost (NaN-aware, string categoricals),
     * compute feature importances for that target,
     * aggregate model importances into a per-target mean_rank,
     * save:
@@ -92,17 +97,7 @@ logging.basicConfig(
 
 
 def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
-    """Detect identifier, feature, and target columns by prefix.
-
-    Args:
-        df: Input DataFrame.
-
-    Returns:
-        A tuple of three lists:
-        - id_cols: Columns starting with ``ID_PREFIX``.
-        - ft_cols: Columns starting with ``FEATURE_PREFIX``.
-        - y_cols: Columns starting with ``TARGET_PREFIX``.
-    """
+    """Detect identifier, feature, and target columns by prefix."""
     id_cols = [col for col in df.columns if col.startswith(ID_PREFIX)]
     ft_cols = [col for col in df.columns if col.startswith(FEATURE_PREFIX)]
     y_cols = [col for col in df.columns if col.startswith(TARGET_PREFIX)]
@@ -115,22 +110,11 @@ def global_feature_cleanup(
 ) -> pd.DataFrame:
     """Perform global unsupervised cleanup on ft_ columns.
 
-    Operations (same for all targets, using all rows):
-      * Drop zero-variance numeric features.
-      * Drop highly correlated numeric features (|corr| > corr_thresh).
-
-    Missing-value filtering is NOT done here; it is done per-target.
-
-    Args:
-        X: Feature matrix with ft_ columns only (all rows).
-        corr_thresh: Threshold for absolute correlation to drop features.
-
-    Returns:
-        A reduced feature matrix after global cleanup (same rows, fewer cols).
+    - Drop zero-variance numeric features.
+    - Drop highly correlated numeric features (|corr| > corr_thresh).
     """
     logging.info("Global cleanup: initial feature count: %d", X.shape[1])
 
-    # Identify numeric vs categorical.
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
 
     # 1) Drop zero-variance numeric features.
@@ -173,18 +157,7 @@ def per_target_missing_cleanup(
     X: pd.DataFrame,
     missing_thresh: float = MISSING_THRESH,
 ) -> pd.DataFrame:
-    """Drop high-missing columns for a specific target's sample subset.
-
-    The missing ratio is computed using ONLY the rows available for that
-    target. Different targets can drop different feature columns.
-
-    Args:
-        X: Feature matrix subset for a single target (rows where y is not NaN).
-        missing_thresh: Threshold for maximum allowed missing fraction.
-
-    Returns:
-        A reduced feature matrix for this target.
-    """
+    """Drop high-missing columns for a specific target's sample subset."""
     missing_ratio = X.isna().mean()
     drop_missing = missing_ratio[missing_ratio > missing_thresh].index.tolist()
     if drop_missing:
@@ -203,30 +176,20 @@ def encode_categoricals_catboost(
 ) -> Tuple[pd.DataFrame, List[str]]:
     """Encode categorical features using CatBoostEncoder.
 
-    This does **not** combine rare categories. All category levels are
-    preserved as-is and encoded into numeric features.
-
-    Also:
-    - coerces all columns to numeric,
-    - leaves NaNs as-is (no imputation).
-
-    Args:
-        X: Feature matrix after per-target cleanup (subset of rows & cols).
-        y: Target series aligned with ``X`` (numeric / label-encoded).
-
-    Returns:
-        A tuple of:
-        - X_enc: Encoded, numeric feature matrix (may contain NaNs).
-        - cat_cols: Names of categorical columns that were encoded.
+    Rules:
+    - Any column with dtype "object" is treated as categorical.
+    - These categoricals (including hash/ID-like strings) are encoded.
+    - All columns are coerced to numeric; NaNs are allowed.
     """
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = [col for col in X.columns if col not in num_cols]
+    cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
+    num_cols = [col for col in X.columns if col not in cat_cols]
 
     if cat_cols:
         logging.info(
             "Encoding %d categorical columns with CatBoostEncoder for this "
-            "target",
+            "target: %s",
             len(cat_cols),
+            cat_cols,
         )
         encoder = CatBoostEncoder(cols=cat_cols, random_state=RANDOM_STATE)
         X_enc = encoder.fit_transform(X, y)
@@ -237,6 +200,16 @@ def encode_categoricals_catboost(
     # Ensure everything is numeric for RF / LGBM / XGB.
     X_enc = X_enc.apply(pd.to_numeric, errors="coerce")
 
+    # Safety: drop any columns that somehow remain non-numeric.
+    obj_after = X_enc.select_dtypes(include=["object"]).columns.tolist()
+    if obj_after:
+        logging.warning(
+            "Dropping %d columns that remain non-numeric after encoding: %s",
+            len(obj_after),
+            obj_after,
+        )
+        X_enc = X_enc.drop(columns=obj_after)
+
     return X_enc, cat_cols
 
 
@@ -244,16 +217,8 @@ def get_xgb_importance(X: pd.DataFrame, y: pd.Series) -> pd.Series:
     """Train XGBoost and compute feature importances (gain).
 
     Handles both:
-    - legacy XGBoost where feature names are "f0", "f1", ...
-    - modern XGBoost where feature names are actual column names.
-
-    Args:
-        X: Encoded feature matrix (all numeric; NaNs allowed).
-        y: Target series (numeric / label-encoded).
-
-    Returns:
-        A pandas Series of normalized feature importances indexed by column
-        names of ``X``.
+    - feature names "f0", "f1", ...
+    - actual column names.
     """
     logging.info("Training XGBoost for feature importance")
     model = XGBClassifier(
@@ -273,7 +238,7 @@ def get_xgb_importance(X: pd.DataFrame, y: pd.Series) -> pd.Series:
     importance = pd.Series(0.0, index=X.columns)
 
     for fname, score in raw_score.items():
-        # Case 1: XGBoost returns actual column names (modern behavior).
+        # Case 1: XGBoost returns actual column names.
         if fname in importance.index:
             importance[fname] = score
             continue
@@ -298,30 +263,7 @@ def compute_model_importances_for_target(
     X_cb: pd.DataFrame,
     cat_cols_cb: List[str],
 ) -> pd.DataFrame:
-    """Compute feature importances from RF, LightGBM, CatBoost, and XGBoost.
-
-    All models here support NaN values:
-      - RandomForestClassifier (sklearn>=1.4)
-      - LightGBM
-      - XGBoost
-      - CatBoost
-
-    Args:
-        X_enc:
-            Encoded feature matrix (numeric; may contain NaNs) for
-            RandomForest, LightGBM, and XGBoost.
-        y:
-            Target series for the current y_ column (numeric / label-encoded).
-        X_cb:
-            Original (non-encoded) feature matrix for this target
-            (same rows and columns as X_enc), for CatBoost.
-        cat_cols_cb:
-            Names of columns in X_cb treated as categorical by CatBoost.
-
-    Returns:
-        DataFrame with columns ``['RF', 'LGBM', 'CB', 'XGB']`` and features
-        as the index, containing per-model importances.
-    """
+    """Compute feature importances from RF, LightGBM, CatBoost, and XGBoost."""
     feature_names = X_enc.columns
 
     # Random Forest
@@ -356,10 +298,11 @@ def compute_model_importances_for_target(
         iterations=500,
         learning_rate=0.05,
         depth=6,
-        loss_function="MultiClass",  # For multiclass. Use 'Logloss' for binary.
+        loss_function="MultiClass",  # use "Logloss" for binary
         random_state=RANDOM_STATE,
         verbose=False,
     )
+
     if cat_cols_cb:
         cat_indices = [X_cb.columns.get_loc(col) for col in cat_cols_cb]
     else:
@@ -387,22 +330,7 @@ def save_per_model_rankings(
     y_col: str,
     df_imp: pd.DataFrame,
 ) -> None:
-    """Save per-model feature rankings to separate CSV files.
-
-    For each model column in df_imp (RF, LGBM, CB, XGB), create a CSV with
-    columns:
-        - feature
-        - importance
-        - rank
-    sorted by ascending rank (most important first).
-
-    Files are named:
-        feature_importances_<y_col>_<model>.csv
-
-    Args:
-        y_col: Name of the current target column.
-        df_imp: DataFrame of importances with columns RF, LGBM, CB, XGB.
-    """
+    """Save per-model feature rankings to separate CSV files."""
     for model_name in ["RF", "LGBM", "CB", "XGB"]:
         if model_name not in df_imp.columns:
             continue
@@ -441,17 +369,14 @@ def main() -> None:
     )
 
     if not ft_cols:
-        msg = "No feature columns (ft_*) detected."
-        raise ValueError(msg)
+        raise ValueError("No feature columns (ft_*) detected.")
     if not y_cols:
-        msg = "No target columns (y_*) detected."
-        raise ValueError(msg)
+        raise ValueError("No target columns (y_*) detected.")
 
     # GLOBAL: unsupervised cleanup on all ft_ columns (zero-variance + corr).
     X_all = df[ft_cols].copy()
     X_base = global_feature_cleanup(X_all)
 
-    # Global feature index, used for global aggregation.
     base_feature_names = X_base.columns
 
     # For global aggregation across targets (over mean_rank).
@@ -460,7 +385,6 @@ def main() -> None:
 
     # Loop over all y_ targets.
     for y_col in y_cols:
-        # Select rows where this target is not missing.
         df_target = df[df[y_col].notna()].copy()
         n_rows = df_target.shape[0]
 
@@ -477,7 +401,6 @@ def main() -> None:
 
         y_raw = df_target[y_col]
 
-        # Label-encode y if it is non-numeric (e.g., string classes).
         if not np.issubdtype(y_raw.dtype, np.number):
             logging.info("Label-encoding non-numeric target for %s", y_col)
             le = LabelEncoder()
@@ -488,7 +411,6 @@ def main() -> None:
         else:
             y = y_raw.copy()
 
-        # Ensure y is integer type for all models.
         y = y.astype("int64")
 
         # Align global-cleaned features with these rows.
@@ -497,7 +419,6 @@ def main() -> None:
         # PER-TARGET: drop features with >80% missing (only on these rows).
         X_target = per_target_missing_cleanup(X_subset)
 
-        # If we dropped everything, skip.
         if X_target.shape[1] == 0:
             logging.info(
                 "Skipping %s: all features dropped by per-target missing filter",
@@ -505,18 +426,18 @@ def main() -> None:
             )
             continue
 
-        # Identify categorical columns for this target (for CatBoost).
-        num_cols_t = X_target.select_dtypes(include=[np.number]).columns.tolist()
-        cat_cols_t = [col for col in X_target.columns if col not in num_cols_t]
+        # Identify categorical columns for CatBoost on ORIGINAL features.
+        cat_cols_t = X_target.select_dtypes(include=["object"]).columns.tolist()
 
         # Encode categoricals for RF / LGBM / XGB (keep NaNs).
-        X_enc, _ = encode_categoricals_catboost(
-            X=X_target,
-            y=y,
-        )
+        X_enc, _ = encode_categoricals_catboost(X=X_target, y=y)
 
-        # For CatBoost, use original features (with same rows/cols as X_target).
+        # ------------------------------------------------------------------
+        # Prepare CatBoost input: categorical as strings, NaNs -> "NA_CAT".
+        # ------------------------------------------------------------------
         X_cb = X_target.copy()
+        for c in cat_cols_t:
+            X_cb[c] = X_cb[c].astype("string").fillna("NA_CAT")
 
         # Compute per-model importances for this target.
         df_imp = compute_model_importances_for_target(
@@ -546,14 +467,12 @@ def main() -> None:
 
         # Update global aggregation only for features that exist for this target.
         aligned_rank = mean_rank.reindex(base_feature_names)
-
         valid_mask = aligned_rank.notna()
         global_rank_sum.loc[valid_mask] += aligned_rank.loc[valid_mask]
         global_rank_count.loc[valid_mask] += 1
 
     # After all targets processed, compute global ranking.
-    processed_any = (global_rank_count > 0).any()
-    if not processed_any:
+    if not (global_rank_count > 0).any():
         logging.warning(
             "No targets processed (all had fewer than %d labelled rows "
             "or all features dropped). Global ranking will not be created.",
@@ -561,7 +480,6 @@ def main() -> None:
         )
         return
 
-    # Avoid division by zero by masking where count == 0.
     valid_global = global_rank_count > 0
     global_mean_rank = pd.Series(np.inf, index=base_feature_names)
     global_mean_rank.loc[valid_global] = (
@@ -591,11 +509,11 @@ def main() -> None:
             f.write(f"{feat}\n")
     logging.info("Saved list of top %d features to %s", TOP_K_FEATURES, top_feat_path)
 
-    # Create and save a reduced dataset with only:
+    # Create and save a reduced dataset with:
     # id_ columns + top ft_ columns + all y_ columns.
-    id_cols, ft_cols_all, y_cols = detect_columns(df)
+    id_cols_final, ft_cols_all, y_cols_final = detect_columns(df)
     keep_ft = [c for c in top_features_global if c in ft_cols_all]
-    reduced_cols = id_cols + keep_ft + y_cols
+    reduced_cols = id_cols_final + keep_ft + y_cols_final
     df_reduced = df[reduced_cols].copy()
     df_reduced.to_csv(REDUCED_DATA_PATH, index=False)
     logging.info(
