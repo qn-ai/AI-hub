@@ -35,6 +35,9 @@ Pipeline:
 - Aggregate per-target mean_rank across all processed y_ columns into a
   global ranking and save as
   ``feature_importances_global_all_targets.csv``.
+- From the global ranking, pick the top TOP_K_FEATURES (150 by default),
+  save their names, and write a reduced dataset CSV with:
+    id_ columns + top ft_ columns + all y_ columns.
 """
 
 from __future__ import annotations
@@ -65,12 +68,13 @@ TARGET_PREFIX = "y_"
 
 MISSING_THRESH = 0.8  # Drop features with > 80% missing (per target).
 CORR_THRESH = 0.95  # Drop numeric features with |corr| > 0.95 (global).
-TOP_K_FEATURES = 100  # Number of top features to log as "top features".
+TOP_K_FEATURES = 150  # Number of top features to select globally.
 MIN_SAMPLES_PER_TARGET = 200  # Skip targets with fewer labelled rows.
 
 RANDOM_STATE = 42
 
 OUTPUT_DIR = Path("feature_importances")  # Folder for CSV outputs.
+REDUCED_DATA_PATH = "input_data_top150_features.csv"  # Reduced dataset.
 
 # =====================================================================
 # LOGGING
@@ -239,6 +243,10 @@ def encode_categoricals_catboost(
 def get_xgb_importance(X: pd.DataFrame, y: pd.Series) -> pd.Series:
     """Train XGBoost and compute feature importances (gain).
 
+    Handles both:
+    - legacy XGBoost where feature names are "f0", "f1", ...
+    - modern XGBoost where feature names are actual column names.
+
     Args:
         X: Encoded feature matrix (all numeric; NaNs allowed).
         y: Target series (numeric / label-encoded).
@@ -263,12 +271,21 @@ def get_xgb_importance(X: pd.DataFrame, y: pd.Series) -> pd.Series:
     raw_score = booster.get_score(importance_type="gain")
 
     importance = pd.Series(0.0, index=X.columns)
+
     for fname, score in raw_score.items():
-        # XGBoost uses feature names f0, f1, ...
-        idx = int(fname[1:])
-        if idx < len(X.columns):
-            col_name = X.columns[idx]
-            importance[col_name] = score
+        # Case 1: XGBoost returns actual column names (modern behavior).
+        if fname in importance.index:
+            importance[fname] = score
+            continue
+
+        # Case 2: legacy behavior "f0", "f1", ...
+        if fname.startswith("f"):
+            rest = fname[1:]
+            if rest.isdigit():
+                idx = int(rest)
+                if idx < len(X.columns):
+                    col_name = X.columns[idx]
+                    importance[col_name] = score
 
     if importance.sum() > 0:
         importance = importance / importance.sum()
@@ -413,7 +430,6 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     logging.info("Loading data from %s", DATA_PATH)
-    # low_memory=False for more stable dtype inference on wide tables.
     df = pd.read_csv(DATA_PATH, low_memory=False)
 
     id_cols, ft_cols, y_cols = detect_columns(df)
@@ -562,11 +578,31 @@ def main() -> None:
         out_path_global,
     )
 
-    # Log top-K globally important features.
+    # Pick top-K globally important features.
     top_features_global = df_global_sorted.head(TOP_K_FEATURES).index.tolist()
     logging.info("Global top %d features across all targets:", TOP_K_FEATURES)
     for feature in top_features_global:
         logging.info("  %s", feature)
+
+    # Save the list of top features.
+    top_feat_path = OUTPUT_DIR / f"top_{TOP_K_FEATURES}_features.txt"
+    with top_feat_path.open("w", encoding="utf-8") as f:
+        for feat in top_features_global:
+            f.write(f"{feat}\n")
+    logging.info("Saved list of top %d features to %s", TOP_K_FEATURES, top_feat_path)
+
+    # Create and save a reduced dataset with only:
+    # id_ columns + top ft_ columns + all y_ columns.
+    id_cols, ft_cols_all, y_cols = detect_columns(df)
+    keep_ft = [c for c in top_features_global if c in ft_cols_all]
+    reduced_cols = id_cols + keep_ft + y_cols
+    df_reduced = df[reduced_cols].copy()
+    df_reduced.to_csv(REDUCED_DATA_PATH, index=False)
+    logging.info(
+        "Saved reduced dataset with %d features to %s",
+        len(keep_ft),
+        REDUCED_DATA_PATH,
+    )
 
 
 if __name__ == "__main__":
