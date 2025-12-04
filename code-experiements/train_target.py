@@ -64,34 +64,69 @@ def train_one_target(
 
     X = df_t[features]
     y_raw = df_t[y_col]
-
+    
     if not np.issubdtype(y_raw.dtype, np.number):
         le = LabelEncoder()
         y = le.fit_transform(y_raw.astype(str))
     else:
         le = None
         y = y_raw.to_numpy()
+    
+    # 🔍 binary vs multiclass
+    classes = np.unique(y)
+    n_classes = classes.size
+    is_binary = n_classes == 2
+    log.info(
+        "Target %s: %d classes detected (%s)",
+        y_col,
+        n_classes,
+        "binary" if is_binary else "multiclass",
+    )
 
     cat_cols = list(X.select_dtypes(include=["object", "string"]).columns)
     n_features = X.shape[1]
 
+    # Base models for numeric pipeline, adapted to binary / multiclass
+    if is_binary:
+        lgbm_base = LGBMClassifier(
+            objective="binary",
+            random_state=RANDOM_STATE,
+            n_jobs=1,
+        )
+        xgb_base = XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            random_state=RANDOM_STATE,
+            tree_method="hist",
+            n_jobs=1,
+        )
+    else:
+        lgbm_base = LGBMClassifier(
+            objective="multiclass",
+            num_class=n_classes,
+            random_state=RANDOM_STATE,
+            n_jobs=1,
+        )
+        xgb_base = XGBClassifier(
+            objective="multi:softprob",
+            eval_metric="mlogloss",
+            random_state=RANDOM_STATE,
+            tree_method="hist",
+            n_jobs=1,
+            num_class=n_classes,
+        )
+    
     numeric_model_specs = {
         "RF": (
             RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=1),
             RF_PARAM_GRID,
         ),
         "LGBM": (
-            LGBMClassifier(random_state=RANDOM_STATE, n_jobs=1),
+            lgbm_base,
             LGBM_PARAM_GRID,
         ),
         "XGB": (
-            XGBClassifier(
-                objective="multi:softprob",
-                eval_metric="mlogloss",
-                random_state=RANDOM_STATE,
-                tree_method="hist",
-                n_jobs=1,
-            ),
+            xgb_base,
             XGB_PARAM_GRID,
         ),
     }
@@ -145,7 +180,7 @@ def train_one_target(
         # 2) CatBoost raw categorical
         log.info("Target %s: CV for CatBoost (raw)", y_col)
         cb_params, cb_metrics = evaluate_catboost_raw_cv(
-            CAT_PARAM_GRID, X, y, cat_cols
+        CAT_PARAM_GRID, X, y, cat_cols, is_binary=is_binary
         )
         cb_metrics.update(
             {
@@ -212,8 +247,10 @@ def train_one_target(
             X_cb = _prepare_catboost_X(X, cat_cols)
             cat_indices = [X_cb.columns.get_loc(c) for c in cat_cols]
 
+            loss_fn = "Logloss" if is_binary else "MultiClass"
+
             cb_best = CatBoostClassifier(
-                loss_function="MultiClass",
+                loss_function=loss_fn,
                 random_state=RANDOM_STATE,
                 verbose=False,
                 **best_params,
