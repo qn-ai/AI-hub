@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""Stage-1: Multi-target feature importance using RF, LGBM, XGB, CatBoost, HGB.
+"""Stage-1: Multi-target feature importance using RF, LGBM, XGB, CatBoost, HGB
+with MLflow logging.
 
 Assumes a wide table with:
 - identifier columns starting with ``id_``,
@@ -23,7 +24,8 @@ For each target y_*:
     - aggregate per-feature mean_rank across models,
     - save combined CSV: feature_importances_<y_col>.csv
       with columns: feature_name, RF, LGBM, CB, XGB, HGB, mean_rank
-    - optionally save per-model CSVs: _RF, _LGBM, _CB, _XGB, _HGB.
+    - optionally save per-model CSVs: _RF, _LGBM, _CB, _XGB, _HGB
+    - log params / metrics / artifacts to MLflow (one run per y_col).
 
 Optionally, aggregate mean_rank across all targets into a global ranking file:
     feature_importances_global_all_targets.csv
@@ -35,6 +37,7 @@ import logging
 from pathlib import Path
 from typing import List, Tuple
 
+import mlflow
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
@@ -72,6 +75,13 @@ RF_MEDIAN_IMPUTE_NUMERIC = True             # median-impute numeric NaNs for RF 
 SAVE_PER_MODEL_FILES = False                # write _RF/_LGBM/_CB/_XGB/_HGB CSVs
 SAVE_GLOBAL_RANKING = True                  # write global ranking CSV
 
+# MLflow (local) for Stage-1
+MLFLOW_TRACKING_URI_STAGE1 = "file:./mlruns"
+MLFLOW_EXPERIMENT_NAME_STAGE1 = "stage1_feature_importances"
+
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI_STAGE1)
+mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME_STAGE1)
+
 # =====================================================================
 # LOGGING
 # =====================================================================
@@ -98,22 +108,25 @@ def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
 def global_feature_cleanup(
     X: pd.DataFrame,
     corr_thresh: float = CORR_THRESH,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, int, int]:
     """Perform global unsupervised cleanup on ft_ columns (optional).
 
-    - Drop zero-variance numeric features.
-    - Drop highly correlated numeric features (|corr| > corr_thresh).
+    Returns:
+        X_clean, n_zero_variance_dropped, n_corr_dropped
     """
     if not USE_GLOBAL_VAR_CORR_CLEANUP:
         log.info(
             "Global cleanup disabled (USE_GLOBAL_VAR_CORR_CLEANUP=False); "
             "keeping all ft_ columns as-is."
         )
-        return X
+        return X, 0, 0
 
     log.info("Global cleanup: initial feature count: %d", X.shape[1])
 
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+
+    n_drop_var = 0
+    n_drop_corr = 0
 
     # 1) Drop zero-variance numeric features.
     if num_cols:
@@ -125,10 +138,11 @@ def global_feature_cleanup(
             col for col, keep in zip(num_cols, keep_mask) if keep
         ]
         drop_var = [col for col in num_cols if col not in keep_num_cols]
+        n_drop_var = len(drop_var)
         if drop_var:
             log.info(
                 "Global cleanup: dropping %d numeric columns with zero variance",
-                len(drop_var),
+                n_drop_var,
             )
             X = X.drop(columns=drop_var)
             num_cols = keep_num_cols
@@ -139,39 +153,45 @@ def global_feature_cleanup(
         upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
 
         to_drop = [column for column in upper.columns if any(upper[column] > corr_thresh)]
+        n_drop_corr = len(to_drop)
         if to_drop:
             log.info(
                 "Global cleanup: dropping %d numeric columns with corr > %.2f",
-                len(to_drop),
+                n_drop_corr,
                 corr_thresh,
             )
             X = X.drop(columns=to_drop)
 
     log.info("Global cleanup: feature count after cleanup: %d", X.shape[1])
-    return X
+    return X, n_drop_var, n_drop_corr
 
 
 def per_target_missing_cleanup(
     X: pd.DataFrame,
     missing_thresh: float = MISSING_THRESH,
-) -> pd.DataFrame:
-    """Drop high-missing columns for a specific target's sample subset (optional)."""
+) -> tuple[pd.DataFrame, int]:
+    """Drop high-missing columns for a specific target's sample subset (optional).
+
+    Returns:
+        X_clean, n_dropped
+    """
     if not USE_PER_TARGET_MISSING_CLEANUP:
         log.info(
             "Per-target missing cleanup disabled; keeping all features for this target."
         )
-        return X
+        return X, 0
 
     missing_ratio = X.isna().mean()
     drop_missing = missing_ratio[missing_ratio > missing_thresh].index.tolist()
+    n_drop = len(drop_missing)
     if drop_missing:
         log.info(
             "Per-target cleanup: dropping %d columns with missing_ratio > %.2f",
-            len(drop_missing),
+            n_drop,
             missing_thresh,
         )
         X = X.drop(columns=drop_missing)
-    return X
+    return X, n_drop
 
 
 def encode_categoricals_catboost(
@@ -180,11 +200,10 @@ def encode_categoricals_catboost(
 ) -> Tuple[pd.DataFrame, List[str]]:
     """Encode categorical features using CatBoostEncoder (optional).
 
-    Rules:
     - Any column with dtype "object" is treated as categorical.
     - If USE_CATBOOST_ENCODER=True, encode these categoricals.
-    - If USE_CATBOOST_ENCODER=False, drop object columns (log a warning).
-    - All columns are coerced to numeric; NaNs are allowed.
+    - If USE_CATBOOST_ENCODER=False, drop object columns (warning).
+    - All columns coerced to numeric; NaNs allowed.
     """
     cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
 
@@ -208,7 +227,6 @@ def encode_categoricals_catboost(
             )
         X_enc = X.drop(columns=cat_cols)
 
-    # Ensure everything is numeric for RF / LGBM / XGB / HGB.
     X_enc = X_enc.apply(pd.to_numeric, errors="coerce")
 
     obj_after = X_enc.select_dtypes(include=["object"]).columns.tolist()
@@ -259,12 +277,10 @@ def get_xgb_importance(
     importance = pd.Series(0.0, index=X.columns)
 
     for fname, score in raw_score.items():
-        # Case 1: XGBoost returns actual column names.
         if fname in importance.index:
             importance[fname] = score
             continue
 
-        # Case 2: legacy behavior "f0", "f1", ...
         if fname.startswith("f"):
             rest = fname[1:]
             if rest.isdigit():
@@ -321,14 +337,13 @@ def compute_model_importances_for_target(
     """Compute feature importances from RF, LGBM, XGB, CatBoost, and HGB."""
     feature_names = X_enc.columns
 
-    # ---------------- RandomForest ----------------
+    # RF
     log.info("Training RandomForest for feature importance")
     rf = RandomForestClassifier(
         n_estimators=500,
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
-
     if RF_MEDIAN_IMPUTE_NUMERIC:
         X_rf = X_enc.copy()
         medians = X_rf.median()
@@ -336,10 +351,9 @@ def compute_model_importances_for_target(
         rf.fit(X_rf, y)
     else:
         rf.fit(X_enc, y)
-
     imp_rf = pd.Series(rf.feature_importances_, index=feature_names)
 
-    # ---------------- LightGBM ----------------
+    # LightGBM
     log.info("Training LightGBM for feature importance")
     if is_binary:
         lgbm = LGBMClassifier(
@@ -365,7 +379,7 @@ def compute_model_importances_for_target(
     lgbm.fit(X_enc, y)
     imp_lgb = pd.Series(lgbm.feature_importances_, index=feature_names)
 
-    # ---------------- XGBoost ----------------
+    # XGBoost
     imp_xgb = get_xgb_importance(
         X_enc,
         y,
@@ -373,10 +387,9 @@ def compute_model_importances_for_target(
         n_classes=n_classes,
     )
 
-    # ---------------- CatBoost ----------------
+    # CatBoost
     log.info("Training CatBoost for feature importance")
     loss_fn = "Logloss" if is_binary else "MultiClass"
-
     cb = CatBoostClassifier(
         iterations=500,
         learning_rate=0.05,
@@ -385,19 +398,17 @@ def compute_model_importances_for_target(
         random_state=RANDOM_STATE,
         verbose=False,
     )
-
     if cat_cols_cb:
         cat_indices = [X_cb.columns.get_loc(col) for col in cat_cols_cb]
     else:
         cat_indices = None
-
     cb.fit(X_cb, y, cat_features=cat_indices)
 
     imp_cb_raw = cb.get_feature_importance()
     imp_cb = pd.Series(imp_cb_raw, index=X_cb.columns)
     imp_cb_aligned = imp_cb.reindex(feature_names).fillna(0.0)
 
-    # ---------------- HGB ----------------
+    # HGB
     imp_hgb = get_hgb_importance(X_enc, y)
     imp_hgb_aligned = imp_hgb.reindex(feature_names).fillna(0.0)
 
@@ -417,14 +428,19 @@ def compute_model_importances_for_target(
 def save_per_model_rankings(
     y_col: str,
     df_imp: pd.DataFrame,
-) -> None:
-    """Save per-model feature rankings to separate CSV files (optional)."""
+) -> list[Path]:
+    """Save per-model feature rankings to separate CSV files (optional).
+
+    Returns:
+        List of created file paths (for MLflow artifacts).
+    """
+    paths: list[Path] = []
     if not SAVE_PER_MODEL_FILES:
         log.info(
             "SAVE_PER_MODEL_FILES=False -> skipping per-model CSV exports for %s",
             y_col,
         )
-        return
+        return paths
 
     for model_name in ["RF", "LGBM", "CB", "XGB", "HGB"]:
         if model_name not in df_imp.columns:
@@ -443,6 +459,9 @@ def save_per_model_rankings(
         out_path = OUTPUT_DIR / f"feature_importances_{y_col}_{model_name}.csv"
         out_df.to_csv(out_path, index=False)
         log.info("Saved %s ranking for %s to %s", model_name, y_col, out_path)
+        paths.append(out_path)
+
+    return paths
 
 
 # =====================================================================
@@ -472,7 +491,7 @@ def main() -> None:
 
     # Global unsupervised cleanup on all ft_ columns.
     X_all = df[ft_cols].copy()
-    X_base = global_feature_cleanup(X_all)
+    X_base, n_drop_var, n_drop_corr = global_feature_cleanup(X_all)
     base_feature_names = X_base.columns
 
     # For global aggregation across targets.
@@ -519,18 +538,14 @@ def main() -> None:
             continue
 
         is_binary = n_classes == 2
-        log.info(
-            "Target %s: %d classes (%s)",
-            y_col,
-            n_classes,
-            "binary" if is_binary else "multiclass",
-        )
 
         # Align global-cleaned features with these rows.
         X_subset = X_base.loc[df_target.index].copy()
+        n_features_before = X_subset.shape[1]
 
         # Per-target missing cleanup.
-        X_target = per_target_missing_cleanup(X_subset)
+        X_target, n_drop_missing = per_target_missing_cleanup(X_subset)
+        n_features_after = X_target.shape[1]
 
         if X_target.shape[1] == 0:
             log.info(
@@ -550,43 +565,69 @@ def main() -> None:
         for c in cat_cols_t:
             X_cb[c] = X_cb[c].astype("string").fillna("NA_CAT")
 
-        # Compute per-model importances.
-        df_imp = compute_model_importances_for_target(
-            X_enc=X_enc,
-            y=y,
-            X_cb=X_cb,
-            cat_cols_cb=cat_cols_t,
-            is_binary=is_binary,
-            n_classes=n_classes,
-        )
+        # Start MLflow run for this target
+        with mlflow.start_run(run_name=y_col):
+            # Log basic params
+            mlflow.log_param("target", y_col)
+            mlflow.log_param("n_samples", int(n_rows))
+            mlflow.log_param("n_classes", int(n_classes))
+            mlflow.log_param("is_binary", bool(is_binary))
+            mlflow.log_param("n_features_before_target_cleanup", int(n_features_before))
+            mlflow.log_param("n_features_after_target_cleanup", int(n_features_after))
 
-        # Per-target mean rank.
-        rank_df = df_imp.rank(method="average", ascending=False)
-        mean_rank = rank_df.mean(axis=1)
+            # Log global cleanup stats (same for all targets, but ok)
+            mlflow.log_param("use_global_var_corr_cleanup", bool(USE_GLOBAL_VAR_CORR_CLEANUP))
+            mlflow.log_param("use_per_target_missing_cleanup", bool(USE_PER_TARGET_MISSING_CLEANUP))
+            mlflow.log_param("use_catboost_encoder", bool(USE_CATBOOST_ENCODER))
+            mlflow.log_param("rf_median_impute_numeric", bool(RF_MEDIAN_IMPUTE_NUMERIC))
+            mlflow.log_param("n_global_zero_var_dropped", int(n_drop_var))
+            mlflow.log_param("n_global_corr_dropped", int(n_drop_corr))
+            mlflow.log_metric("n_target_missing_dropped", float(n_drop_missing))
 
-        df_imp_with_rank = df_imp.copy()
-        df_imp_with_rank["mean_rank"] = mean_rank
+            mlflow.log_param("random_state", RANDOM_STATE)
 
-        # Explicit feature_name column in combined file.
-        df_out = (
-            df_imp_with_rank
-            .sort_values("mean_rank", ascending=True)
-            .reset_index()
-            .rename(columns={"index": "feature_name"})
-        )
+            # Compute per-model importances for this target.
+            df_imp = compute_model_importances_for_target(
+                X_enc=X_enc,
+                y=y,
+                X_cb=X_cb,
+                cat_cols_cb=cat_cols_t,
+                is_binary=is_binary,
+                n_classes=n_classes,
+            )
 
-        out_path_target = OUTPUT_DIR / f"feature_importances_{y_col}.csv"
-        df_out.to_csv(out_path_target, index=False)
-        log.info("Saved combined feature importances to %s", out_path_target)
+            # Per-target mean rank.
+            rank_df = df_imp.rank(method="average", ascending=False)
+            mean_rank = rank_df.mean(axis=1)
 
-        # Optional per-model CSVs.
-        save_per_model_rankings(y_col, df_imp)
+            df_imp_with_rank = df_imp.copy()
+            df_imp_with_rank["mean_rank"] = mean_rank
 
-        # Update global aggregation.
-        aligned_rank = mean_rank.reindex(base_feature_names)
-        valid_mask = aligned_rank.notna()
-        global_rank_sum.loc[valid_mask] += aligned_rank.loc[valid_mask]
-        global_rank_count.loc[valid_mask] += 1
+            # Explicit feature_name column in combined file.
+            df_out = (
+                df_imp_with_rank
+                .sort_values("mean_rank", ascending=True)
+                .reset_index()
+                .rename(columns={"index": "feature_name"})
+            )
+
+            out_path_target = OUTPUT_DIR / f"feature_importances_{y_col}.csv"
+            df_out.to_csv(out_path_target, index=False)
+            log.info("Saved combined feature importances to %s", out_path_target)
+
+            # Log artifact for this target
+            mlflow.log_artifact(str(out_path_target))
+
+            # Optional per-model CSVs.
+            per_model_paths = save_per_model_rankings(y_col, df_imp)
+            for p in per_model_paths:
+                mlflow.log_artifact(str(p))
+
+            # Update global aggregation.
+            aligned_rank = mean_rank.reindex(base_feature_names)
+            valid_mask = aligned_rank.notna()
+            global_rank_sum.loc[valid_mask] += aligned_rank.loc[valid_mask]
+            global_rank_count.loc[valid_mask] += 1
 
     # Global ranking across all targets (optional).
     if not SAVE_GLOBAL_RANKING:
@@ -606,14 +647,22 @@ def main() -> None:
     )
 
     df_global = (
-        pd.DataFrame({"feature_name": base_feature_names,
-                      "global_mean_rank": global_mean_rank.values})
+        pd.DataFrame(
+            {"feature_name": base_feature_names,
+             "global_mean_rank": global_mean_rank.values}
+        )
         .sort_values("global_mean_rank", ascending=True)
     )
 
     out_path_global = OUTPUT_DIR / "feature_importances_global_all_targets.csv"
     df_global.to_csv(out_path_global, index=False)
     log.info("Saved global feature ranking to %s", out_path_global)
+
+    # Log global ranking as a separate run for bookkeeping
+    with mlflow.start_run(run_name="global_feature_ranking"):
+        mlflow.log_param("n_features_global", int(len(base_feature_names)))
+        mlflow.log_param("n_targets_contributed", int((global_rank_count > 0).sum()))
+        mlflow.log_artifact(str(out_path_global))
 
 
 if __name__ == "__main__":
