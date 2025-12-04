@@ -1,88 +1,60 @@
 # config.py
-from __future__ import annotations
+from pathlib import Path
+import os
 
-import mlflow
-from catboost import CatBoostClassifier
-from lightgbm import LGBMClassifier
-from sklearn.ensemble import RandomForestClassifier
+# -----------------------
+# Paths
+# -----------------------
+DATA_PATH = "input_data_top150_features.csv"
+FEATURE_IMPORTANCE_DIR = Path("feature_importances")
+MODELS_DIR = Path("trained_models")
 
-# ---- Paths ----
-DATA_PATH = "input_data.csv"  # <- change if your file is elsewhere
+RESULTS_CSV_PATH = "model_cv_results_parallel.csv"
+RESULTS_JSON_PATH = "model_cv_results_parallel.json"
+RESOURCE_SUMMARY_PATH = "training_resource_summary.json"
 
-# ---- General settings ----
+# -----------------------
+# Column prefixes
+# -----------------------
+ID_PREFIX = "id_"
+FEATURE_PREFIX = "ft_"
+TARGET_PREFIX = "y_"
+
+# -----------------------
+# Training settings
+# -----------------------
+MIN_SAMPLES_PER_TARGET = 200
+N_SPLITS = 3
 RANDOM_STATE = 42
-N_JOBS = -1
-TEST_SIZE = 0.2
-N_OUTER_FOLDS = 5
 
-EXPERIMENT_NAME = "multitarget_rf_lgbm_catboost"
+# -----------------------
+# Parallel settings
+# -----------------------
+_CPU_COUNT = os.cpu_count() or 4
+AUTO_JOBS = max(min(_CPU_COUNT // 2, 8), 2)  # good for up to 16 CPUs
+N_JOBS_TARGETS = AUTO_JOBS
 
-RESULTS_CSV_PATH = "multitarget_model_comparison_results.csv"
-AGG_PLOT_PATH = "multitarget_model_comparison_plot.png"
+# -----------------------
+# Param grids (1 config/model to save compute)
+# -----------------------
+RF_PARAM_GRID = [
+    {"n_estimators": 300, "max_depth": None, "max_features": "sqrt"},
+]
 
+LGBM_PARAM_GRID = [
+    {"n_estimators": 400, "num_leaves": 31, "learning_rate": 0.04},
+]
 
-def setup_mlflow() -> None:
-    """
-    Configure MLflow tracking.
-
-    By default:
-      - local tracking in ./mlruns
-
-    If you have a remote MLflow server with S3 artifact root, you can change
-    the tracking URI here, e.g.:
-
-        mlflow.set_tracking_uri("http://your-mlflow-server:5000")
-    """
-    mlflow.set_tracking_uri("file:./mlruns")
-    mlflow.set_experiment(EXPERIMENT_NAME)
-
-
-def get_models_and_spaces() -> dict:
-    """
-    Return model definitions and hyperparameter search spaces for
-    RandomForest, LightGBM, and CatBoost.
-    """
-    models_and_spaces: dict = {
-        "RandomForest": {
-            "estimator": RandomForestClassifier(
-                random_state=RANDOM_STATE,
-                n_jobs=N_JOBS,
-            ),
-            "param_distributions": {
-                "n_estimators": [200, 400, 600],
-                "max_depth": [None, 10, 20, 30],
-                "min_samples_split": [2, 5, 10],
-                "min_samples_leaf": [1, 2, 4],
-                "max_features": ["sqrt", "log2", 0.5],
-            },
-        },
-        "LightGBM": {
-            "estimator": LGBMClassifier(
-                objective="multiclass",
-                random_state=RANDOM_STATE,
-                n_jobs=N_JOBS,
-            ),
-            "param_distributions": {
-                "n_estimators": [300, 600, 900],
-                "num_leaves": [31, 63, 127],
-                "max_depth": [-1, 10, 20],
-                "learning_rate": [0.01, 0.05, 0.1],
-                "subsample": [0.7, 0.9, 1.0],
-                "colsample_bytree": [0.7, 0.9, 1.0],
-            },
-        },
-        "CatBoost": {
-            "estimator": CatBoostClassifier(
-                loss_function="MultiClass",
-                verbose=False,
-                random_seed=RANDOM_STATE,
-            ),
-            "param_distributions": {
-                "depth": [4, 6, 8, 10],
-                "learning_rate": [0.01, 0.05, 0.1],
-                "l2_leaf_reg": [1, 3, 5, 7],
-                "iterations": [300, 600, 900],
-            },
-        },
+XGB_PARAM_GRID = [
+    {
+        "n_estimators": 400,
+        "max_depth": 7,
+        "learning_rate": 0.04,
+        "subsample": 0.9,
+        "colsample_bytree": 0.9,
     }
-    return models_and_spaces
+]
+
+CAT_PARAM_GRID = [
+    {"iterations": 400, "depth": 7, "learning_rate": 0.04, "l2_leaf_reg": 4.0}
+]
