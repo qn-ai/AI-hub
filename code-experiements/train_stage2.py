@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Stage-2: train per-target models using Stage-1 feature_importances.
+"""Stage-2: train per-target models using Stage-1 feature_importances + MLflow.
 
 Requirements:
 - Stage-1 has already run, producing files like:
@@ -29,6 +29,7 @@ This script:
     * Selects best model by f1.
     * Retrains best model on full data for that target.
     * Saves best model to trained_models/<y_col>_best.joblib.
+    * Logs params + metrics to MLflow (one run per target).
 - Runs targets in parallel using joblib.
 - Writes:
     - model_cv_results_parallel.csv  (summary per target)
@@ -45,6 +46,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 import joblib
+import mlflow
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
@@ -87,6 +89,13 @@ N_JOBS_TARGETS = max(min(_CPU - 1, 12), 2)
 
 # Toggle: Use CatBoostEncoder for RF/LGBM/XGB/HGB
 USE_CATBOOST_ENCODER = True
+
+# MLflow local config
+MLFLOW_TRACKING_URI = "file:./mlruns"
+MLFLOW_EXPERIMENT_NAME = "stage2_multi_target_training"
+
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
 # =====================================================================
 # LOGGING
@@ -287,9 +296,12 @@ def evaluate_model_cv(
 
 
 def train_one_target(y_col: str) -> Optional[dict]:
-    """Train all models for a single target and return summary dict."""
-    start_time = time.time()
+    """Train all models for a single target and return summary dict.
 
+    This function also creates one MLflow run for the target and logs:
+        - params: target, n_classes, is_binary, n_features, n_samples, best_model
+        - metrics for each model: <MODEL>_<metric>
+    """
     df = pd.read_csv(DATA_PATH, low_memory=False)
     id_cols, ft_cols, y_cols = detect_columns(df)
 
@@ -328,116 +340,153 @@ def train_one_target(y_col: str) -> Optional[dict]:
     X_enc = encode_for_non_catboost(X, y)
     X_cb, cat_cols_cb = prepare_catboost_input(X)
 
-    results: dict[str, dict] = {}
-    best_f1 = -1.0
-    best_model = None
-    best_name = None
+    start_time = time.time()
 
-    # ---------------- RF ----------------
-    rf = RandomForestClassifier(
-        n_estimators=500,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-    )
-    res_rf = evaluate_model_cv(rf, X_enc, y, is_binary)
-    results["RF"] = res_rf
-    if res_rf["f1"] > best_f1:
-        best_f1 = res_rf["f1"]
-        best_model = rf
-        best_name = "RF"
+    # One MLflow run per target
+    with mlflow.start_run(run_name=y_col):
+        # Basic params
+        mlflow.log_param("target", y_col)
+        mlflow.log_param("n_samples", int(n_rows))
+        mlflow.log_param("n_features", len(selected_features))
+        mlflow.log_param("n_classes", int(n_classes))
+        mlflow.log_param("is_binary", bool(is_binary))
 
-    # ---------------- LGBM ----------------
-    lgbm = LGBMClassifier(
-        n_estimators=400,
-        learning_rate=0.05,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        objective="binary" if is_binary else "multiclass",
-        num_class=n_classes if not is_binary else None,
-    )
-    res_lgb = evaluate_model_cv(lgbm, X_enc, y, is_binary)
-    results["LGBM"] = res_lgb
-    if res_lgb["f1"] > best_f1:
-        best_f1 = res_lgb["f1"]
-        best_model = lgbm
-        best_name = "LGBM"
+        results: dict[str, dict] = {}
+        best_f1 = -1.0
+        best_model = None
+        best_name = None
 
-    # ---------------- XGB ----------------
-    xgb = XGBClassifier(
-        n_estimators=400,
-        max_depth=7,
-        learning_rate=0.04,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        objective="binary:logistic" if is_binary else "multi:softprob",
-        num_class=n_classes if not is_binary else None,
-    )
-    res_xgb = evaluate_model_cv(xgb, X_enc, y, is_binary)
-    results["XGB"] = res_xgb
-    if res_xgb["f1"] > best_f1:
-        best_f1 = res_xgb["f1"]
-        best_model = xgb
-        best_name = "XGB"
+        # ---------------- RF ----------------
+        rf = RandomForestClassifier(
+            n_estimators=500,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        )
+        res_rf = evaluate_model_cv(rf, X_enc, y, is_binary)
+        results["RF"] = res_rf
 
-    # ---------------- HGB ----------------
-    hgb = HistGradientBoostingClassifier(
-        loss="log_loss",
-        max_depth=None,
-        learning_rate=0.05,
-        max_bins=255,
-        l2_regularization=0.0,
-        random_state=RANDOM_STATE,
-    )
-    res_hgb = evaluate_model_cv(hgb, X_enc, y, is_binary)
-    results["HGB"] = res_hgb
-    if res_hgb["f1"] > best_f1:
-        best_f1 = res_hgb["f1"]
-        best_model = hgb
-        best_name = "HGB"
+        # log RF metrics
+        for m_name, m_val in res_rf.items():
+            mlflow.log_metric(f"RF_{m_name}", m_val)
 
-    # ---------------- CatBoost ----------------
-    cb = CatBoostClassifier(
-        iterations=400,
-        depth=7,
-        learning_rate=0.05,
-        random_state=RANDOM_STATE,
-        loss_function="Logloss" if is_binary else "MultiClass",
-        verbose=False,
-    )
-    res_cb = evaluate_model_cv(cb, X_cb, y, is_binary)
-    results["CB"] = res_cb
-    if res_cb["f1"] > best_f1:
-        best_f1 = res_cb["f1"]
-        best_model = cb
-        best_name = "CB"
+        if res_rf["f1"] > best_f1:
+            best_f1 = res_rf["f1"]
+            best_model = rf
+            best_name = "RF"
 
-    if best_model is None:
-        log.warning("No valid model for %s.", y_col)
-        return None
+        # ---------------- LGBM ----------------
+        lgbm = LGBMClassifier(
+            n_estimators=400,
+            learning_rate=0.05,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            objective="binary" if is_binary else "multiclass",
+            num_class=n_classes if not is_binary else None,
+        )
+        res_lgb = evaluate_model_cv(lgbm, X_enc, y, is_binary)
+        results["LGBM"] = res_lgb
+        for m_name, m_val in res_lgb.items():
+            mlflow.log_metric(f"LGBM_{m_name}", m_val)
 
-    # Retrain best model on full data
-    if best_name == "CB":
-        best_model.fit(X_cb, y)
-    else:
-        best_model.fit(X_enc, y)
+        if res_lgb["f1"] > best_f1:
+            best_f1 = res_lgb["f1"]
+            best_model = lgbm
+            best_name = "LGBM"
 
-    MODELS_DIR.mkdir(exist_ok=True)
-    model_path = MODELS_DIR / f"{y_col}_best.joblib"
-    joblib.dump(best_model, model_path)
+        # ---------------- XGB ----------------
+        xgb = XGBClassifier(
+            n_estimators=400,
+            max_depth=7,
+            learning_rate=0.04,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            objective="binary:logistic" if is_binary else "multi:softprob",
+            num_class=n_classes if not is_binary else None,
+        )
+        res_xgb = evaluate_model_cv(xgb, X_enc, y, is_binary)
+        results["XGB"] = res_xgb
+        for m_name, m_val in res_xgb.items():
+            mlflow.log_metric(f"XGB_{m_name}", m_val)
 
-    elapsed = time.time() - start_time
-    log.info(
-        "Finished %s -> best=%s, f1=%.4f, time=%.1fs, features=%d, samples=%d",
-        y_col,
-        best_name,
-        best_f1,
-        elapsed,
-        len(selected_features),
-        n_rows,
-    )
+        if res_xgb["f1"] > best_f1:
+            best_f1 = res_xgb["f1"]
+            best_model = xgb
+            best_name = "XGB"
 
+        # ---------------- HGB ----------------
+        hgb = HistGradientBoostingClassifier(
+            loss="log_loss",
+            max_depth=None,
+            learning_rate=0.05,
+            max_bins=255,
+            l2_regularization=0.0,
+            random_state=RANDOM_STATE,
+        )
+        res_hgb = evaluate_model_cv(hgb, X_enc, y, is_binary)
+        results["HGB"] = res_hgb
+        for m_name, m_val in res_hgb.items():
+            mlflow.log_metric(f"HGB_{m_name}", m_val)
+
+        if res_hgb["f1"] > best_f1:
+            best_f1 = res_hgb["f1"]
+            best_model = hgb
+            best_name = "HGB"
+
+        # ---------------- CatBoost ----------------
+        cb = CatBoostClassifier(
+            iterations=400,
+            depth=7,
+            learning_rate=0.05,
+            random_state=RANDOM_STATE,
+            loss_function="Logloss" if is_binary else "MultiClass",
+            verbose=False,
+        )
+        res_cb = evaluate_model_cv(cb, X_cb, y, is_binary)
+        results["CB"] = res_cb
+        for m_name, m_val in res_cb.items():
+            mlflow.log_metric(f"CB_{m_name}", m_val)
+
+        if res_cb["f1"] > best_f1:
+            best_f1 = res_cb["f1"]
+            best_model = cb
+            best_name = "CB"
+
+        if best_model is None:
+            log.warning("No valid model for %s.", y_col)
+            mlflow.log_param("best_model", "None")
+            return None
+
+        elapsed = time.time() - start_time
+
+        # Retrain best model on full data
+        if best_name == "CB":
+            best_model.fit(X_cb, y)
+        else:
+            best_model.fit(X_enc, y)
+
+        MODELS_DIR.mkdir(exist_ok=True)
+        model_path = MODELS_DIR / f"{y_col}_best.joblib"
+        joblib.dump(best_model, model_path)
+
+        # Log best model info to MLflow
+        mlflow.log_param("best_model", best_name)
+        mlflow.log_metric("best_f1", best_f1)
+        mlflow.log_metric("time_sec", elapsed)
+        mlflow.log_artifact(str(model_path))
+
+        log.info(
+            "Finished %s -> best=%s, f1=%.4f, time=%.1fs, features=%d, samples=%d",
+            y_col,
+            best_name,
+            best_f1,
+            elapsed,
+            len(selected_features),
+            n_rows,
+        )
+
+    # Return summary for aggregation
     return {
         "target": y_col,
         "best_model": best_name,
