@@ -1,39 +1,6 @@
 #!/usr/bin/env python
-"""Stage-2: train per-target models using Stage-1 feature_importances + MLflow.
-
-Requirements:
-- Stage-1 has already run, producing files like:
-    feature_importances/feature_importances_<y_col>.csv
-  with columns:
-    feature_name, RF, LGBM, CB, XGB, HGB, mean_rank
-
-This script:
-- Loads input_data.csv.
-- Detects id_, ft_, y_ columns.
-- For each target y_:
-    * Filters rows with non-missing y_.
-    * Loads its feature_importances_<y>.csv.
-    * Selects features where RF > 0 & LGBM > 0 & CB > 0 & XGB > 0 & HGB > 0.
-    * Detects binary vs multiclass.
-    * Builds two "views":
-        - Encoded numeric view for RF / LGBM / XGB / HGB
-          (CatBoostEncoder for object if enabled).
-        - Raw-categorical view for CatBoost.
-    * Cross-validates five models:
-        - RandomForestClassifier
-        - LGBMClassifier
-        - XGBClassifier
-        - HistGradientBoostingClassifier
-        - CatBoostClassifier
-    * Computes metrics: accuracy, precision, recall, f1, AUC.
-    * Selects best model by f1.
-    * Retrains best model on full data for that target.
-    * Saves best model to trained_models/<y_col>_best.joblib.
-    * Logs params + metrics to MLflow (one run per target).
-- Runs targets in parallel using joblib.
-- Writes:
-    - model_cv_results_parallel.csv  (summary per target)
-    - model_cv_results_parallel.json (full results)
+"""Stage-2: train per-target models using Stage-1 feature_importances
+with optional MLflow logging.
 """
 
 from __future__ import annotations
@@ -42,11 +9,11 @@ import json
 import logging
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Tuple, Optional
 
 import joblib
-import mlflow
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
@@ -83,19 +50,23 @@ MIN_SAMPLES_PER_TARGET = 200
 N_SPLITS = 3
 RANDOM_STATE = 42
 
-# Parallelism
 _CPU = os.cpu_count() or 4
 N_JOBS_TARGETS = max(min(_CPU - 1, 12), 2)
 
-# Toggle: Use CatBoostEncoder for RF/LGBM/XGB/HGB
 USE_CATBOOST_ENCODER = True
 
-# MLflow local config
+# ---- MLflow toggle ----
+USE_MLFLOW_STAGE2 = False
 MLFLOW_TRACKING_URI = "file:./mlruns"
 MLFLOW_EXPERIMENT_NAME = "stage2_multi_target_training"
 
-mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+if USE_MLFLOW_STAGE2:
+    import mlflow  # type: ignore
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+else:
+    mlflow = None  # type: ignore
 
 # =====================================================================
 # LOGGING
@@ -113,7 +84,6 @@ log = logging.getLogger(__name__)
 
 
 def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
-    """Detect id_, ft_, and y_ columns in the dataframe."""
     id_cols = [c for c in df.columns if c.startswith(ID_PREFIX)]
     ft_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
     y_cols = [c for c in df.columns if c.startswith(TARGET_PREFIX)]
@@ -124,17 +94,6 @@ def load_selected_features_for_target(
     y_col: str,
     ft_cols_all: List[str],
 ) -> List[str]:
-    """Select features for a target based on Stage-1 combined FI CSV.
-
-    Expects a file:
-        feature_importances/feature_importances_<y_col>.csv
-
-    Schema:
-        feature_name, RF, LGBM, CB, XGB, HGB, mean_rank, ...
-
-    Selection rule:
-        RF > 0 & LGBM > 0 & CB > 0 & XGB > 0 & HGB > 0
-    """
     all_csvs = list(FEATURE_IMPORTANCE_DIR.glob("*.csv"))
     if not all_csvs:
         log.error(
@@ -145,7 +104,6 @@ def load_selected_features_for_target(
 
     excluded_suffixes = ("_RF.csv", "_LGBM.csv", "_CB.csv", "_XGB.csv", "_HGB.csv")
     combined_files = [p for p in all_csvs if not p.name.endswith(excluded_suffixes)]
-
     if not combined_files:
         log.error(
             "All feature importance files appear to be per-model only; "
@@ -167,7 +125,6 @@ def load_selected_features_for_target(
     log.info("Using feature importance file for %s: %s", y_col, file_path)
 
     fi_df = pd.read_csv(file_path)
-
     required_cols = ["RF", "LGBM", "CB", "XGB", "HGB"]
     missing = [c for c in required_cols if c not in fi_df.columns]
     if missing:
@@ -188,7 +145,6 @@ def load_selected_features_for_target(
 
     mask = (fi_df[required_cols] > 0).all(axis=1)
     selected = fi_df.loc[mask, "feature_name"].astype(str).tolist()
-
     selected = [f for f in selected if f in ft_cols_all]
 
     log.info(
@@ -204,7 +160,6 @@ def encode_for_non_catboost(
     X: pd.DataFrame,
     y: pd.Series,
 ) -> pd.DataFrame:
-    """Encode object columns for RF/LGBM/XGB/HGB using CatBoostEncoder (optional)."""
     cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
 
     if USE_CATBOOST_ENCODER:
@@ -227,8 +182,7 @@ def encode_for_non_catboost(
 
 def prepare_catboost_input(
     X: pd.DataFrame,
-) -> Tuple[pd.DataFrame, List[str]]:
-    """Prepare input dataframe and categorical column list for CatBoost."""
+) -> tuple[pd.DataFrame, List[str]]:
     X2 = X.copy()
     cat_cols = X2.select_dtypes(include=["object"]).columns.tolist()
     for c in cat_cols:
@@ -243,7 +197,6 @@ def evaluate_model_cv(
     is_binary: bool,
     n_splits: int = N_SPLITS,
 ) -> dict:
-    """Evaluate model via StratifiedKFold CV with multiple metrics."""
     skf = StratifiedKFold(
         n_splits=n_splits,
         shuffle=True,
@@ -296,12 +249,6 @@ def evaluate_model_cv(
 
 
 def train_one_target(y_col: str) -> Optional[dict]:
-    """Train all models for a single target and return summary dict.
-
-    This function also creates one MLflow run for the target and logs:
-        - params: target, n_classes, is_binary, n_features, n_samples, best_model
-        - metrics for each model: <MODEL>_<metric>
-    """
     df = pd.read_csv(DATA_PATH, low_memory=False)
     id_cols, ft_cols, y_cols = detect_columns(df)
 
@@ -320,7 +267,6 @@ def train_one_target(y_col: str) -> Optional[dict]:
         )
         return None
 
-    # Encode target as integer labels
     y = df_t[y_col].astype("category").cat.codes
     n_classes = y.nunique()
     if n_classes < 2:
@@ -328,35 +274,37 @@ def train_one_target(y_col: str) -> Optional[dict]:
         return None
     is_binary = n_classes == 2
 
-    # Feature selection from Stage-1
     selected_features = load_selected_features_for_target(y_col, ft_cols)
     if not selected_features:
         log.info("No selected features for %s. Skipping.", y_col)
         return None
 
     X = df_t[selected_features]
-
-    # Two views: encoded numeric (RF/LGBM/XGB/HGB) and raw-cat (CB)
     X_enc = encode_for_non_catboost(X, y)
     X_cb, cat_cols_cb = prepare_catboost_input(X)
 
     start_time = time.time()
 
-    # One MLflow run per target
-    with mlflow.start_run(run_name=y_col):
-        # Basic params
-        mlflow.log_param("target", y_col)
-        mlflow.log_param("n_samples", int(n_rows))
-        mlflow.log_param("n_features", len(selected_features))
-        mlflow.log_param("n_classes", int(n_classes))
-        mlflow.log_param("is_binary", bool(is_binary))
+    # MLflow context (no-op if disabled)
+    if USE_MLFLOW_STAGE2:
+        run_ctx = mlflow.start_run(run_name=y_col)  # type: ignore
+    else:
+        run_ctx = nullcontext()
+
+    with run_ctx:
+        if USE_MLFLOW_STAGE2:
+            mlflow.log_param("target", y_col)  # type: ignore
+            mlflow.log_param("n_samples", int(n_rows))  # type: ignore
+            mlflow.log_param("n_features", len(selected_features))  # type: ignore
+            mlflow.log_param("n_classes", int(n_classes))  # type: ignore
+            mlflow.log_param("is_binary", bool(is_binary))  # type: ignore
 
         results: dict[str, dict] = {}
         best_f1 = -1.0
         best_model = None
         best_name = None
 
-        # ---------------- RF ----------------
+        # RF
         rf = RandomForestClassifier(
             n_estimators=500,
             random_state=RANDOM_STATE,
@@ -364,17 +312,15 @@ def train_one_target(y_col: str) -> Optional[dict]:
         )
         res_rf = evaluate_model_cv(rf, X_enc, y, is_binary)
         results["RF"] = res_rf
-
-        # log RF metrics
-        for m_name, m_val in res_rf.items():
-            mlflow.log_metric(f"RF_{m_name}", m_val)
-
+        if USE_MLFLOW_STAGE2:
+            for m_name, m_val in res_rf.items():
+                mlflow.log_metric(f"RF_{m_name}", m_val)  # type: ignore
         if res_rf["f1"] > best_f1:
             best_f1 = res_rf["f1"]
             best_model = rf
             best_name = "RF"
 
-        # ---------------- LGBM ----------------
+        # LGBM
         lgbm = LGBMClassifier(
             n_estimators=400,
             learning_rate=0.05,
@@ -385,15 +331,15 @@ def train_one_target(y_col: str) -> Optional[dict]:
         )
         res_lgb = evaluate_model_cv(lgbm, X_enc, y, is_binary)
         results["LGBM"] = res_lgb
-        for m_name, m_val in res_lgb.items():
-            mlflow.log_metric(f"LGBM_{m_name}", m_val)
-
+        if USE_MLFLOW_STAGE2:
+            for m_name, m_val in res_lgb.items():
+                mlflow.log_metric(f"LGBM_{m_name}", m_val)  # type: ignore
         if res_lgb["f1"] > best_f1:
             best_f1 = res_lgb["f1"]
             best_model = lgbm
             best_name = "LGBM"
 
-        # ---------------- XGB ----------------
+        # XGB
         xgb = XGBClassifier(
             n_estimators=400,
             max_depth=7,
@@ -407,15 +353,15 @@ def train_one_target(y_col: str) -> Optional[dict]:
         )
         res_xgb = evaluate_model_cv(xgb, X_enc, y, is_binary)
         results["XGB"] = res_xgb
-        for m_name, m_val in res_xgb.items():
-            mlflow.log_metric(f"XGB_{m_name}", m_val)
-
+        if USE_MLFLOW_STAGE2:
+            for m_name, m_val in res_xgb.items():
+                mlflow.log_metric(f"XGB_{m_name}", m_val)  # type: ignore
         if res_xgb["f1"] > best_f1:
             best_f1 = res_xgb["f1"]
             best_model = xgb
             best_name = "XGB"
 
-        # ---------------- HGB ----------------
+        # HGB
         hgb = HistGradientBoostingClassifier(
             loss="log_loss",
             max_depth=None,
@@ -426,15 +372,15 @@ def train_one_target(y_col: str) -> Optional[dict]:
         )
         res_hgb = evaluate_model_cv(hgb, X_enc, y, is_binary)
         results["HGB"] = res_hgb
-        for m_name, m_val in res_hgb.items():
-            mlflow.log_metric(f"HGB_{m_name}", m_val)
-
+        if USE_MLFLOW_STAGE2:
+            for m_name, m_val in res_hgb.items():
+                mlflow.log_metric(f"HGB_{m_name}", m_val)  # type: ignore
         if res_hgb["f1"] > best_f1:
             best_f1 = res_hgb["f1"]
             best_model = hgb
             best_name = "HGB"
 
-        # ---------------- CatBoost ----------------
+        # CatBoost
         cb = CatBoostClassifier(
             iterations=400,
             depth=7,
@@ -445,9 +391,9 @@ def train_one_target(y_col: str) -> Optional[dict]:
         )
         res_cb = evaluate_model_cv(cb, X_cb, y, is_binary)
         results["CB"] = res_cb
-        for m_name, m_val in res_cb.items():
-            mlflow.log_metric(f"CB_{m_name}", m_val)
-
+        if USE_MLFLOW_STAGE2:
+            for m_name, m_val in res_cb.items():
+                mlflow.log_metric(f"CB_{m_name}", m_val)  # type: ignore
         if res_cb["f1"] > best_f1:
             best_f1 = res_cb["f1"]
             best_model = cb
@@ -455,7 +401,8 @@ def train_one_target(y_col: str) -> Optional[dict]:
 
         if best_model is None:
             log.warning("No valid model for %s.", y_col)
-            mlflow.log_param("best_model", "None")
+            if USE_MLFLOW_STAGE2:
+                mlflow.log_param("best_model", "None")  # type: ignore
             return None
 
         elapsed = time.time() - start_time
@@ -470,11 +417,11 @@ def train_one_target(y_col: str) -> Optional[dict]:
         model_path = MODELS_DIR / f"{y_col}_best.joblib"
         joblib.dump(best_model, model_path)
 
-        # Log best model info to MLflow
-        mlflow.log_param("best_model", best_name)
-        mlflow.log_metric("best_f1", best_f1)
-        mlflow.log_metric("time_sec", elapsed)
-        mlflow.log_artifact(str(model_path))
+        if USE_MLFLOW_STAGE2:
+            mlflow.log_param("best_model", best_name)  # type: ignore
+            mlflow.log_metric("best_f1", best_f1)  # type: ignore
+            mlflow.log_metric("time_sec", elapsed)  # type: ignore
+            mlflow.log_artifact(str(model_path))  # type: ignore
 
         log.info(
             "Finished %s -> best=%s, f1=%.4f, time=%.1fs, features=%d, samples=%d",
@@ -486,7 +433,6 @@ def train_one_target(y_col: str) -> Optional[dict]:
             n_rows,
         )
 
-    # Return summary for aggregation
     return {
         "target": y_col,
         "best_model": best_name,
@@ -498,7 +444,7 @@ def train_one_target(y_col: str) -> Optional[dict]:
 
 
 # =====================================================================
-# MAIN (PARALLEL OVER TARGETS)
+# MAIN
 # =====================================================================
 
 
