@@ -1,34 +1,6 @@
 #!/usr/bin/env python
 """Stage-1: Multi-target feature importance using RF, LGBM, XGB, CatBoost, HGB
-with MLflow logging.
-
-Assumes a wide table with:
-- identifier columns starting with ``id_``,
-- feature columns starting with ``ft_``,
-- target columns starting with ``y_``.
-
-For each target y_*:
-    - subset rows where y_* is non-missing,
-    - optional per-target missing cleanup on ft_ columns,
-    - label-encode y if needed,
-    - detect binary vs multiclass,
-    - encode categoricals for RF/LGBM/XGB/HGB via CatBoostEncoder (optional),
-    - prepare raw-categorical input for CatBoost,
-    - train:
-        * RandomForest
-        * LightGBM
-        * XGBoost
-        * CatBoost
-        * HistGradientBoostingClassifier
-    - compute feature importances,
-    - aggregate per-feature mean_rank across models,
-    - save combined CSV: feature_importances_<y_col>.csv
-      with columns: feature_name, RF, LGBM, CB, XGB, HGB, mean_rank
-    - optionally save per-model CSVs: _RF, _LGBM, _CB, _XGB, _HGB
-    - log params / metrics / artifacts to MLflow (one run per y_col).
-
-Optionally, aggregate mean_rank across all targets into a global ranking file:
-    feature_importances_global_all_targets.csv
+with optional MLflow logging.
 """
 
 from __future__ import annotations
@@ -36,8 +8,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import List, Tuple
+from contextlib import nullcontext
 
-import mlflow
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
@@ -75,12 +47,19 @@ RF_MEDIAN_IMPUTE_NUMERIC = True             # median-impute numeric NaNs for RF 
 SAVE_PER_MODEL_FILES = False                # write _RF/_LGBM/_CB/_XGB/_HGB CSVs
 SAVE_GLOBAL_RANKING = True                  # write global ranking CSV
 
-# MLflow (local) for Stage-1
+# ---- MLflow toggle ----
+USE_MLFLOW_STAGE1 = False
 MLFLOW_TRACKING_URI_STAGE1 = "file:./mlruns"
 MLFLOW_EXPERIMENT_NAME_STAGE1 = "stage1_feature_importances"
 
-mlflow.set_tracking_uri(MLFLOW_TRACKING_URI_STAGE1)
-mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME_STAGE1)
+if USE_MLFLOW_STAGE1:
+    import mlflow  # type: ignore
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI_STAGE1)
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME_STAGE1)
+else:
+    mlflow = None  # type: ignore
+
 
 # =====================================================================
 # LOGGING
@@ -109,7 +88,7 @@ def global_feature_cleanup(
     X: pd.DataFrame,
     corr_thresh: float = CORR_THRESH,
 ) -> tuple[pd.DataFrame, int, int]:
-    """Perform global unsupervised cleanup on ft_ columns (optional).
+    """Global unsupervised cleanup on ft_ columns (optional).
 
     Returns:
         X_clean, n_zero_variance_dropped, n_corr_dropped
@@ -124,7 +103,6 @@ def global_feature_cleanup(
     log.info("Global cleanup: initial feature count: %d", X.shape[1])
 
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-
     n_drop_var = 0
     n_drop_corr = 0
 
@@ -170,11 +148,7 @@ def per_target_missing_cleanup(
     X: pd.DataFrame,
     missing_thresh: float = MISSING_THRESH,
 ) -> tuple[pd.DataFrame, int]:
-    """Drop high-missing columns for a specific target's sample subset (optional).
-
-    Returns:
-        X_clean, n_dropped
-    """
+    """Drop high-missing columns for a specific target's sample subset (optional)."""
     if not USE_PER_TARGET_MISSING_CLEANUP:
         log.info(
             "Per-target missing cleanup disabled; keeping all features for this target."
@@ -198,13 +172,7 @@ def encode_categoricals_catboost(
     X: pd.DataFrame,
     y: pd.Series,
 ) -> Tuple[pd.DataFrame, List[str]]:
-    """Encode categorical features using CatBoostEncoder (optional).
-
-    - Any column with dtype "object" is treated as categorical.
-    - If USE_CATBOOST_ENCODER=True, encode these categoricals.
-    - If USE_CATBOOST_ENCODER=False, drop object columns (warning).
-    - All columns coerced to numeric; NaNs allowed.
-    """
+    """Encode categorical features using CatBoostEncoder (optional)."""
     cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
 
     if USE_CATBOOST_ENCODER and cat_cols:
@@ -429,11 +397,7 @@ def save_per_model_rankings(
     y_col: str,
     df_imp: pd.DataFrame,
 ) -> list[Path]:
-    """Save per-model feature rankings to separate CSV files (optional).
-
-    Returns:
-        List of created file paths (for MLflow artifacts).
-    """
+    """Save per-model feature rankings to separate CSV files (optional)."""
     paths: list[Path] = []
     if not SAVE_PER_MODEL_FILES:
         log.info(
@@ -565,26 +529,43 @@ def main() -> None:
         for c in cat_cols_t:
             X_cb[c] = X_cb[c].astype("string").fillna("NA_CAT")
 
-        # Start MLflow run for this target
-        with mlflow.start_run(run_name=y_col):
-            # Log basic params
-            mlflow.log_param("target", y_col)
-            mlflow.log_param("n_samples", int(n_rows))
-            mlflow.log_param("n_classes", int(n_classes))
-            mlflow.log_param("is_binary", bool(is_binary))
-            mlflow.log_param("n_features_before_target_cleanup", int(n_features_before))
-            mlflow.log_param("n_features_after_target_cleanup", int(n_features_after))
+        # MLflow context (no-op if USE_MLFLOW_STAGE1=False)
+        if USE_MLFLOW_STAGE1:
+            run_ctx = mlflow.start_run(run_name=y_col)  # type: ignore
+        else:
+            run_ctx = nullcontext()
 
-            # Log global cleanup stats (same for all targets, but ok)
-            mlflow.log_param("use_global_var_corr_cleanup", bool(USE_GLOBAL_VAR_CORR_CLEANUP))
-            mlflow.log_param("use_per_target_missing_cleanup", bool(USE_PER_TARGET_MISSING_CLEANUP))
-            mlflow.log_param("use_catboost_encoder", bool(USE_CATBOOST_ENCODER))
-            mlflow.log_param("rf_median_impute_numeric", bool(RF_MEDIAN_IMPUTE_NUMERIC))
-            mlflow.log_param("n_global_zero_var_dropped", int(n_drop_var))
-            mlflow.log_param("n_global_corr_dropped", int(n_drop_corr))
-            mlflow.log_metric("n_target_missing_dropped", float(n_drop_missing))
-
-            mlflow.log_param("random_state", RANDOM_STATE)
+        with run_ctx:
+            if USE_MLFLOW_STAGE1:
+                mlflow.log_param("target", y_col)  # type: ignore
+                mlflow.log_param("n_samples", int(n_rows))  # type: ignore
+                mlflow.log_param("n_classes", int(n_classes))  # type: ignore
+                mlflow.log_param("is_binary", bool(is_binary))  # type: ignore
+                mlflow.log_param(  # type: ignore
+                    "n_features_before_target_cleanup", int(n_features_before)
+                )
+                mlflow.log_param(  # type: ignore
+                    "n_features_after_target_cleanup", int(n_features_after)
+                )
+                mlflow.log_param(  # type: ignore
+                    "use_global_var_corr_cleanup",
+                    bool(USE_GLOBAL_VAR_CORR_CLEANUP),
+                )
+                mlflow.log_param(  # type: ignore
+                    "use_per_target_missing_cleanup",
+                    bool(USE_PER_TARGET_MISSING_CLEANUP),
+                )
+                mlflow.log_param(  # type: ignore
+                    "use_catboost_encoder", bool(USE_CATBOOST_ENCODER)
+                )
+                mlflow.log_param(  # type: ignore
+                    "rf_median_impute_numeric",
+                    bool(RF_MEDIAN_IMPUTE_NUMERIC),
+                )
+                mlflow.log_param("n_global_zero_var_dropped", int(n_drop_var))  # type: ignore
+                mlflow.log_param("n_global_corr_dropped", int(n_drop_corr))  # type: ignore
+                mlflow.log_metric("n_target_missing_dropped", float(n_drop_missing))  # type: ignore
+                mlflow.log_param("random_state", RANDOM_STATE)  # type: ignore
 
             # Compute per-model importances for this target.
             df_imp = compute_model_importances_for_target(
@@ -603,7 +584,7 @@ def main() -> None:
             df_imp_with_rank = df_imp.copy()
             df_imp_with_rank["mean_rank"] = mean_rank
 
-            # Explicit feature_name column in combined file.
+            # Combined file with explicit feature_name.
             df_out = (
                 df_imp_with_rank
                 .sort_values("mean_rank", ascending=True)
@@ -615,13 +596,14 @@ def main() -> None:
             df_out.to_csv(out_path_target, index=False)
             log.info("Saved combined feature importances to %s", out_path_target)
 
-            # Log artifact for this target
-            mlflow.log_artifact(str(out_path_target))
+            if USE_MLFLOW_STAGE1:
+                mlflow.log_artifact(str(out_path_target))  # type: ignore
 
             # Optional per-model CSVs.
             per_model_paths = save_per_model_rankings(y_col, df_imp)
-            for p in per_model_paths:
-                mlflow.log_artifact(str(p))
+            if USE_MLFLOW_STAGE1:
+                for p in per_model_paths:
+                    mlflow.log_artifact(str(p))  # type: ignore
 
             # Update global aggregation.
             aligned_rank = mean_rank.reindex(base_feature_names)
@@ -658,11 +640,14 @@ def main() -> None:
     df_global.to_csv(out_path_global, index=False)
     log.info("Saved global feature ranking to %s", out_path_global)
 
-    # Log global ranking as a separate run for bookkeeping
-    with mlflow.start_run(run_name="global_feature_ranking"):
-        mlflow.log_param("n_features_global", int(len(base_feature_names)))
-        mlflow.log_param("n_targets_contributed", int((global_rank_count > 0).sum()))
-        mlflow.log_artifact(str(out_path_global))
+    if USE_MLFLOW_STAGE1:
+        with mlflow.start_run(run_name="global_feature_ranking"):  # type: ignore
+            mlflow.log_param("n_features_global", int(len(base_feature_names)))  # type: ignore
+            mlflow.log_param(  # type: ignore
+                "n_targets_contributed",
+                int((global_rank_count > 0).sum()),
+            )
+            mlflow.log_artifact(str(out_path_global))  # type: ignore
 
 
 if __name__ == "__main__":
