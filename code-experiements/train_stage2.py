@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Stage-2: train per-target models using Stage-1 feature_importances
-with optional MLflow logging.
+with optional MLflow logging, per-target logs, and optional tqdm progress.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import StratifiedKFold
+from tqdm import tqdm
 from xgboost import XGBClassifier
 
 # =====================================================================
@@ -38,6 +39,7 @@ from xgboost import XGBClassifier
 DATA_PATH = "input_data.csv"
 FEATURE_IMPORTANCE_DIR = Path("feature_importances")
 MODELS_DIR = Path("trained_models")
+LOG_DIR = Path("logs")
 
 RESULTS_CSV_PATH = "model_cv_results_parallel.csv"
 RESULTS_JSON_PATH = "model_cv_results_parallel.json"
@@ -54,6 +56,7 @@ _CPU = os.cpu_count() or 4
 N_JOBS_TARGETS = max(min(_CPU - 1, 12), 2)
 
 USE_CATBOOST_ENCODER = True
+USE_PARALLEL_STAGE2 = True  # True = joblib Parallel, False = sequential with tqdm
 
 # ---- MLflow toggle ----
 USE_MLFLOW_STAGE2 = False
@@ -72,11 +75,29 @@ else:
 # LOGGING
 # =====================================================================
 
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+def get_target_logger(y_col: str) -> logging.Logger:
+    """Return a logger that logs to console + logs/<y_col>.log."""
+    logger = logging.getLogger(f"target.{y_col}")
+    logger.setLevel(logging.INFO)
+
+    if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        fh = logging.FileHandler(LOG_DIR / f"{y_col}.log", mode="w", encoding="utf-8")
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    logger.propagate = True
+    return logger
+
 
 # =====================================================================
 # HELPERS
@@ -249,6 +270,11 @@ def evaluate_model_cv(
 
 
 def train_one_target(y_col: str) -> Optional[dict]:
+    """Train all models for a single target and return summary dict."""
+    # Switch logger to per-target
+    global log
+    log = get_target_logger(y_col)
+
     df = pd.read_csv(DATA_PATH, low_memory=False)
     id_cols, ft_cols, y_cols = detect_columns(df)
 
@@ -453,14 +479,22 @@ def main() -> None:
     _, _, y_cols = detect_columns(df)
 
     log.info(
-        "Stage-2: training models for %d targets using %d workers",
+        "Stage-2: training models for %d targets (parallel=%s, workers=%d)",
         len(y_cols),
+        USE_PARALLEL_STAGE2,
         N_JOBS_TARGETS,
     )
 
-    results = Parallel(n_jobs=N_JOBS_TARGETS)(
-        delayed(train_one_target)(y_col) for y_col in y_cols
-    )
+    if USE_PARALLEL_STAGE2:
+        # Parallel: faster, but tqdm can't show incremental progress (only console logs).
+        results = Parallel(n_jobs=N_JOBS_TARGETS)(
+            delayed(train_one_target)(y_col) for y_col in y_cols
+        )
+    else:
+        # Sequential: slower, but nice tqdm progress bar.
+        results = []
+        for y_col in tqdm(y_cols, desc="Stage-2 targets"):
+            results.append(train_one_target(y_col))
 
     results = [r for r in results if r is not None]
     if not results:
