@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Stage-1: Multi-target feature importance using RF, LGBM, XGB, CatBoost, HGB
-with optional MLflow logging.
+with optional MLflow logging and per-target log files.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
 from xgboost import XGBClassifier
 
 # =====================================================================
@@ -38,6 +39,7 @@ MIN_SAMPLES_PER_TARGET = 200  # Skip targets with fewer labelled rows.
 RANDOM_STATE = 42
 
 OUTPUT_DIR = Path("feature_importances")  # Folder for CSV outputs.
+LOG_DIR = Path("logs")                    # Folder for log files.
 
 # ---- Optional toggles ----
 USE_GLOBAL_VAR_CORR_CLEANUP = True          # global variance + correlation cleanup
@@ -65,11 +67,31 @@ else:
 # LOGGING
 # =====================================================================
 
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+def get_target_logger(y_col: str) -> logging.Logger:
+    """Return a logger that logs to console + logs/<y_col>.log."""
+    logger = logging.getLogger(f"target.{y_col}")
+    logger.setLevel(logging.INFO)
+
+    # Attach file handler only once per logger
+    if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        fh = logging.FileHandler(LOG_DIR / f"{y_col}.log", mode="w", encoding="utf-8")
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    # Let messages still propagate to root console handler
+    logger.propagate = True
+    return logger
+
 
 # =====================================================================
 # UTILS
@@ -462,8 +484,12 @@ def main() -> None:
     global_rank_sum = pd.Series(0.0, index=base_feature_names)
     global_rank_count = pd.Series(0, index=base_feature_names, dtype="int64")
 
-    # Loop over all y_ targets.
-    for y_col in y_cols:
+    # Loop over all y_ targets with progress bar.
+    for y_col in tqdm(y_cols, desc="Stage-1 targets"):
+        # Switch logger to per-target file + console
+        global log
+        log = get_target_logger(y_col)
+
         df_target = df[df[y_col].notna()].copy()
         n_rows = df_target.shape[0]
 
