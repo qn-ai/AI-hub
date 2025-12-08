@@ -1,6 +1,43 @@
 #!/usr/bin/env python
-"""Stage-1: Multi-target feature importance using RF, LGBM, XGB, CatBoost, HGB
-with optional MLflow logging and per-target log files.
+"""
+Stage-1: Per-Target Feature Selection via Multi-Model Importances.
+
+This module computes *per-target* feature importances for a wide dataset where:
+- Identifier columns start with ``id_``
+- Feature columns start with ``ft_``
+- Target columns start with ``y_`` (binary or multiclass)
+
+### Overview
+For each target ``y_*``:
+1. Select rows where that target is not missing.
+2. Drop features with excessive missingness (per-target threshold).
+3. Prepare two feature representations:
+   - Encoded numeric view (CatBoostEncoder) for RF/LGBM/XGB/HGB.
+   - Raw categorical view (string-based) for CatBoost.
+4. Train five NaN-aware models:
+   - RandomForestClassifier (sklearn ≥1.4)
+   - LGBMClassifier
+   - XGBClassifier
+   - CatBoostClassifier
+   - HistGradientBoostingClassifier
+5. Extract importances from each model.
+6. Keep features where all five models have importance > 0.
+7. Save:
+   - Combined importance CSV: ``feature_importances_<y>.csv``
+   - Optional per-model CSV files: ``feature_importances_<y>_RF.csv`` etc.
+8. Optionally compute a global feature ranking across all targets.
+
+### Output
+All results are stored under ``feature_importances/``.
+
+### Notes
+- No imputation is performed; models used are NaN-aware.
+- Object/string features are treated as categorical.
+- CatBoostEncoder is used only for the numeric model view.
+- This script contains no model training; only feature reduction.
+
+### Usage
+python compute_feature_importances.py
 """
 
 from __future__ import annotations
