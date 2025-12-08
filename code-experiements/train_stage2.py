@@ -1,57 +1,33 @@
 #!/usr/bin/env python
 """
-Stage-2: Per-Target Model Training with Parallel Cross-Validation.
+Stage-2: Per-Target Model Training with Dynamic CV Folds.
 
-This stage trains a **best model per target** using the selected features from Stage-1.
-It supports wide data, mixed feature types, missing values, and binary or multiclass targets.
+This stage trains a best model per target using features selected in Stage-1.
+It handles:
+- targets with only one label (skipped as non-learnable),
+- very imbalanced targets (dynamic n_splits based on min class count),
+- mixed feature types (numeric + categorical),
+- missing values (NaN-aware models).
 
-### Inputs
-- ``input_data.csv``: full dataset (id_, ft_, y_ columns)
-- ``feature_importances/feature_importances_<y>.csv``: Stage-1 selected features
-- Optional: ``mlflow`` tracking directory
+Inputs
+------
+- input_data.csv :
+    Wide table with:
+        - id_* identifier columns
+        - ft_* feature columns (numeric or object)
+        - y_* target columns (binary or multiclass)
 
-### Overview
-For each target ``y_*`` that has:
-- ≥ MIN_SAMPLES_PER_TARGET labeled rows
-- A valid feature importance file
+- feature_importances/feature_importances_<y>.csv :
+    From Stage-1, must contain:
+        feature_name, RF, LGBM, CB, XGB, HGB, mean_rank
 
-The pipeline:
-1. Loads per-target selected features and extracts the subset of rows where y_* is not missing.
-2. Builds two feature views:
-   - Encoded numeric: CatBoostEncoder → RF, LGBM, XGB, HGB
-   - Raw categorical: string NaN-filled → CatBoost
-3. Detects binary vs multiclass target.
-4. Performs K-fold cross-validation for:
-   - RandomForestClassifier
-   - LGBMClassifier
-   - XGBClassifier
-   - HistGradientBoostingClassifier
-   - CatBoostClassifier
-5. Computes evaluation metrics:
-   - F1, Recall, Precision, AUC
-   - Fit time, prediction time
-6. Selects the **best model** by mean F1 score.
-7. Saves:
-   - ``trained_models/y_<target>_best.joblib``
-   - ``model_cv_results_parallel.csv`` (metrics across all targets)
-   - Optional MLflow logging for reproducibility
-8. Writes logs to:
-   - ``logs/y_<target>_stage2.log``
-
-### Features
-- Fully NaN-aware models; encoder only affects categoricals.
-- Per-target parallel execution for speed (n_jobs configurable).
-- Supports very large numbers of targets (100+).
-- Supports 16-CPU environments with >30GB RAM on Posit Workbench.
-
-### Outputs
-- One best model per target in ``trained_models/``.
-- Aggregated CV metrics in CSV/JSON format.
-- Logs for debugging and reproducibility.
-
-### Usage
-python train_stage2.py
-make stage2
+Outputs
+-------
+- trained_models/y_<target>_best.joblib
+- model_cv_results_parallel.csv
+- model_cv_results_parallel.json
+- logs/y_<target>_stage2.log
+- skipped_targets_stage2.csv (targets skipped with a reason)
 """
 
 from __future__ import annotations
@@ -59,89 +35,82 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
-from contextlib import nullcontext
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier
 from category_encoders import CatBoostEncoder
+from catboost import CatBoostClassifier
 from joblib import Parallel, delayed
 from lightgbm import LGBMClassifier
-from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
     roc_auc_score,
 )
 from sklearn.model_selection import StratifiedKFold
-from tqdm import tqdm
+from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
-# =====================================================================
+# ---------------------------------------------------------------------
 # CONFIG
-# =====================================================================
+# ---------------------------------------------------------------------
 
 DATA_PATH = "input_data.csv"
 FEATURE_IMPORTANCE_DIR = Path("feature_importances")
-MODELS_DIR = Path("trained_models")
+TRAINED_MODELS_DIR = Path("trained_models")
 LOG_DIR = Path("logs")
-
-RESULTS_CSV_PATH = "model_cv_results_parallel.csv"
-RESULTS_JSON_PATH = "model_cv_results_parallel.json"
+RESULTS_CSV = "model_cv_results_parallel.csv"
+RESULTS_JSON = "model_cv_results_parallel.json"
+SKIPPED_CSV = "skipped_targets_stage2.csv"
 
 ID_PREFIX = "id_"
 FEATURE_PREFIX = "ft_"
 TARGET_PREFIX = "y_"
 
-MIN_SAMPLES_PER_TARGET = 200
-N_SPLITS = 3
 RANDOM_STATE = 42
 
+# CV folds: per target n_splits = min(MAX_N_SPLITS, min_class_count)
+MAX_N_SPLITS = 5
+
+# Parallelism
 _CPU = os.cpu_count() or 4
 N_JOBS_TARGETS = max(min(_CPU - 1, 12), 2)
 
 USE_CATBOOST_ENCODER = True
-USE_PARALLEL_STAGE2 = True  # True = joblib Parallel, False = sequential with tqdm
+CAT_FILL_VALUE = "NA_CAT"
 
-# ---- MLflow toggle ----
-USE_MLFLOW_STAGE2 = False
-MLFLOW_TRACKING_URI = "file:./mlruns"
-MLFLOW_EXPERIMENT_NAME = "stage2_multi_target_training"
-
-if USE_MLFLOW_STAGE2:
-    import mlflow  # type: ignore
-
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
-else:
-    mlflow = None  # type: ignore
-
-# =====================================================================
-# LOGGING
-# =====================================================================
-
+TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("stage2")
 
 
 def get_target_logger(y_col: str) -> logging.Logger:
-    """Return a logger that logs to console + logs/<y_col>.log."""
-    logger = logging.getLogger(f"target.{y_col}")
+    """Return per-target logger writing to logs/y_<target>_stage2.log."""
+    logger = logging.getLogger(f"stage2.{y_col}")
     logger.setLevel(logging.INFO)
 
-    if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
-        fh = logging.FileHandler(LOG_DIR / f"{y_col}.log", mode="w", encoding="utf-8")
+    # Attach file handler once
+    if not any(
+        isinstance(h, logging.FileHandler) and getattr(h, "_stage2_file", False)
+        for h in logger.handlers
+    ):
+        fh = logging.FileHandler(LOG_DIR / f"{y_col}_stage2.log", mode="w", encoding="utf-8")
+        fh._stage2_file = True  # type: ignore[attr-defined]
         fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -150,432 +119,452 @@ def get_target_logger(y_col: str) -> logging.Logger:
     return logger
 
 
-# =====================================================================
-# HELPERS
-# =====================================================================
-
+# ---------------------------------------------------------------------
+# UTILS
+# ---------------------------------------------------------------------
 
 def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
+    """Detect id_, ft_, y_ columns by prefix."""
     id_cols = [c for c in df.columns if c.startswith(ID_PREFIX)]
     ft_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
     y_cols = [c for c in df.columns if c.startswith(TARGET_PREFIX)]
     return id_cols, ft_cols, y_cols
 
 
-def load_selected_features_for_target(
-    y_col: str,
-    ft_cols_all: List[str],
-) -> List[str]:
-    all_csvs = list(FEATURE_IMPORTANCE_DIR.glob("*.csv"))
-    if not all_csvs:
-        log.error(
-            "No feature importance CSV files found in %s",
-            FEATURE_IMPORTANCE_DIR,
-        )
+def load_selected_features(y_col: str, logger: logging.Logger) -> List[str]:
+    """Load selected features for a target from Stage-1 combined CSV.
+
+    Only keep rows where RF, LGBM, CB, XGB, HGB > 0.
+    """
+    path = FEATURE_IMPORTANCE_DIR / f"feature_importances_{y_col}.csv"
+    if not path.exists():
+        logger.warning("Feature importance file not found: %s", path)
         return []
 
-    excluded_suffixes = ("_RF.csv", "_LGBM.csv", "_CB.csv", "_XGB.csv", "_HGB.csv")
-    combined_files = [p for p in all_csvs if not p.name.endswith(excluded_suffixes)]
-    if not combined_files:
-        log.error(
-            "All feature importance files appear to be per-model only; "
-            "no combined files found."
-        )
-        return []
+    df_imp = pd.read_csv(path)
+    if "feature_name" not in df_imp.columns:
+        df_imp = df_imp.rename(columns={df_imp.columns[0]: "feature_name"})
 
-    matching_files = [p for p in combined_files if y_col in p.name]
-    if not matching_files:
-        log.error(
-            "No combined feature importance file found for target %s "
-            "(searched filenames containing '%s')",
-            y_col,
-            y_col,
-        )
-        return []
-
-    file_path = max(matching_files, key=lambda p: p.stat().st_size)
-    log.info("Using feature importance file for %s: %s", y_col, file_path)
-
-    fi_df = pd.read_csv(file_path)
-    required_cols = ["RF", "LGBM", "CB", "XGB", "HGB"]
-    missing = [c for c in required_cols if c not in fi_df.columns]
+    required = ["RF", "LGBM", "CB", "XGB", "HGB"]
+    missing = [c for c in required if c not in df_imp.columns]
     if missing:
-        log.error(
-            "Importance file %s for %s is missing required columns %s",
-            file_path,
-            y_col,
-            missing,
-        )
+        logger.warning("Importance file %s missing columns %s", path, missing)
         return []
 
-    if "feature_name" not in fi_df.columns:
-        log.warning(
-            "Column 'feature_name' not found in %s; using first column as feature_name",
-            file_path,
+    mask = (df_imp[required] > 0).all(axis=1)
+    sel = df_imp.loc[mask, "feature_name"].astype(str).tolist()
+    logger.info("Selected %d features for %s", len(sel), y_col)
+    return sel
+
+
+def prepare_target_and_cv(
+    y_raw: pd.Series,
+    max_splits: int,
+    logger: logging.Logger,
+) -> Tuple[Optional[pd.Series], Optional[LabelEncoder], Optional[int]]:
+    """Encode target and choose n_splits based on class distribution.
+
+    - Convert to string categories
+    - Compute class counts
+    - min_count = min(counts)
+    - If min_count < 2 → target is not learnable → return (None, None, None)
+    - Else n_splits_target = min(max_splits, min_count)
+    - Encode with LabelEncoder -> contiguous 0..K-1
+
+    Returns:
+        y_enc, label_encoder, n_splits_target
+    """
+    y_str = y_raw.astype(str)
+    counts = y_str.value_counts()
+    logger.info("Class distribution: %s", counts.to_dict())
+
+    min_count = int(counts.min())
+    n_classes = counts.shape[0]
+
+    if min_count < 2:
+        logger.warning(
+            "Skipping target: min class count = %d < 2 (n_classes=%d).",
+            min_count,
+            n_classes,
         )
-        fi_df = fi_df.rename(columns={fi_df.columns[0]: "feature_name"})
+        return None, None, None
 
-    mask = (fi_df[required_cols] > 0).all(axis=1)
-    selected = fi_df.loc[mask, "feature_name"].astype(str).tolist()
-    selected = [f for f in selected if f in ft_cols_all]
+    n_splits_target = int(min(max_splits, min_count))
+    if n_splits_target < 2:
+        logger.warning("Skipping target: n_splits would be %d < 2.", n_splits_target)
+        return None, None, None
 
-    log.info(
-        "Target %s: %d features selected from %s (RF/LGBM/CB/XGB/HGB > 0)",
-        y_col,
-        len(selected),
-        file_path.name,
+    le = LabelEncoder()
+    y_enc = pd.Series(
+        le.fit_transform(y_str),
+        index=y_raw.index,
+        dtype="int64",
     )
-    return selected
+
+    logger.info(
+        "Using n_splits=%d (min_class_count=%d, n_classes=%d, labels=%s)",
+        n_splits_target,
+        min_count,
+        n_classes,
+        np.unique(y_enc).tolist(),
+    )
+
+    return y_enc, le, n_splits_target
 
 
-def encode_for_non_catboost(
-    X: pd.DataFrame,
-    y: pd.Series,
-) -> pd.DataFrame:
-    cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
-
-    if USE_CATBOOST_ENCODER:
-        if cat_cols:
-            enc = CatBoostEncoder(cols=cat_cols, random_state=RANDOM_STATE)
-            X2 = enc.fit_transform(X, y)
-        else:
-            X2 = X.copy()
-    else:
-        if cat_cols:
-            log.warning(
-                "USE_CATBOOST_ENCODER=False -> dropping %d object columns: %s",
-                len(cat_cols),
-                cat_cols,
-            )
-        X2 = X.drop(columns=cat_cols)
-
-    return X2.apply(pd.to_numeric, errors="coerce")
-
-
-def prepare_catboost_input(
-    X: pd.DataFrame,
-) -> tuple[pd.DataFrame, List[str]]:
-    X2 = X.copy()
-    cat_cols = X2.select_dtypes(include=["object"]).columns.tolist()
+def prepare_catboost_view(X: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """Prepare CatBoost view: string categoricals, NaN -> CAT_FILL_VALUE."""
+    X_cb = X.copy()
+    cat_cols = X_cb.select_dtypes(include=["object"]).columns.tolist()
     for c in cat_cols:
-        X2[c] = X2[c].astype("string").fillna("NA_CAT")
-    return X2, cat_cols
+        X_cb[c] = X_cb[c].astype("string").fillna(CAT_FILL_VALUE)
+    return X_cb, cat_cols
 
 
-def evaluate_model_cv(
-    model,
-    X: pd.DataFrame,
-    y: pd.Series,
+def prepare_numeric_view_with_encoder(X: pd.DataFrame) -> pd.DataFrame:
+    """Prepare numeric encoded view using CatBoostEncoder on all rows.
+
+    This is an unsupervised encoding (dummy target), but consistent with Stage-3.
+    """
+    X_num = X.copy()
+    cat_cols = X_num.select_dtypes(include=["object"]).columns.tolist()
+
+    if USE_CATBOOST_ENCODER and cat_cols:
+        enc = CatBoostEncoder(cols=cat_cols, random_state=RANDOM_STATE)
+        dummy_y = np.zeros(len(X_num))
+        X_num = enc.fit_transform(X_num, dummy_y)
+    elif not USE_CATBOOST_ENCODER and cat_cols:
+        X_num = X_num.drop(columns=cat_cols)
+
+    X_num = X_num.apply(pd.to_numeric, errors="coerce")
+    return X_num
+
+
+def build_models(is_binary: bool) -> Dict[str, object]:
+    """Return dict of model_name -> estimator prototype."""
+    if is_binary:
+        lgbm_obj = "binary"
+        xgb_obj = "binary:logistic"
+        cb_loss = "Logloss"
+    else:
+        lgbm_obj = "multiclass"
+        xgb_obj = "multi:softprob"
+        cb_loss = "MultiClass"
+
+    models = {
+        "RF": RandomForestClassifier(
+            n_estimators=300,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        ),
+        "LGBM": LGBMClassifier(
+            n_estimators=300,
+            learning_rate=0.05,
+            objective=lgbm_obj,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        ),
+        "XGB": XGBClassifier(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective=xgb_obj,
+            eval_metric="logloss",
+            tree_method="hist",
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        ),
+        "HGB": HistGradientBoostingClassifier(
+            random_state=RANDOM_STATE,
+        ),
+        "CB": CatBoostClassifier(
+            iterations=300,
+            depth=6,
+            learning_rate=0.05,
+            loss_function=cb_loss,
+            random_state=RANDOM_STATE,
+            verbose=False,
+        ),
+    }
+    return models
+
+
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_proba: Optional[np.ndarray],
     is_binary: bool,
-    n_splits: int = N_SPLITS,
-) -> dict:
-    skf = StratifiedKFold(
-        n_splits=n_splits,
+) -> Dict[str, float]:
+    """Compute metrics for a single fold."""
+    avg = "binary" if is_binary else "macro"
+    metrics: Dict[str, float] = {}
+    metrics["accuracy"] = accuracy_score(y_true, y_pred)
+    metrics["f1"] = f1_score(y_true, y_pred, average=avg, zero_division=0)
+    metrics["precision"] = precision_score(y_true, y_pred, average=avg, zero_division=0)
+    metrics["recall"] = recall_score(y_true, y_pred, average=avg, zero_division=0)
+
+    if y_proba is not None:
+        try:
+            if is_binary:
+                # y_proba is shape (n_samples,) or (n_samples,2)
+                if y_proba.ndim == 1:
+                    metrics["auc"] = roc_auc_score(y_true, y_proba)
+                else:
+                    metrics["auc"] = roc_auc_score(y_true, y_proba[:, 1])
+            else:
+                metrics["auc"] = roc_auc_score(
+                    y_true,
+                    y_proba,
+                    multi_class="ovr",
+                )
+        except Exception:
+            metrics["auc"] = np.nan
+    else:
+        metrics["auc"] = np.nan
+
+    return metrics
+
+
+def cross_validate_target(
+    y_col: str,
+    X: pd.DataFrame,
+    y_enc: pd.Series,
+    n_splits_target: int,
+    logger: logging.Logger,
+) -> Tuple[Optional[str], Dict[str, Dict[str, float]], Optional[object]]:
+    """Cross-validate all models for a target and return best model name + metrics + best estimator."""
+    is_binary = y_enc.nunique() == 2
+    logger.info("Target %s is %s", y_col, "binary" if is_binary else "multiclass")
+
+    cv = StratifiedKFold(
+        n_splits=n_splits_target,
         shuffle=True,
         random_state=RANDOM_STATE,
     )
 
-    metrics = {
-        "accuracy": [],
-        "precision": [],
-        "recall": [],
-        "f1": [],
-        "auc": [],
-    }
+    # Prepare views
+    X_num = prepare_numeric_view_with_encoder(X)
+    X_cb, cat_cols = prepare_catboost_view(X)
+    cat_indices = [X_cb.columns.get_loc(c) for c in cat_cols]
 
-    for train_idx, val_idx in skf.split(X, y):
-        Xtr, Xv = X.iloc[train_idx], X.iloc[val_idx]
-        ytr, yv = y.iloc[train_idx], y.iloc[val_idx]
+    models = build_models(is_binary)
+    all_results: Dict[str, Dict[str, float]] = {}
+    best_model_name: Optional[str] = None
+    best_f1: float = -np.inf
+    best_estimator: Optional[object] = None
 
-        model.fit(Xtr, ytr)
-        pred = model.predict(Xv)
+    for name, model_proto in models.items():
+        logger.info("CV for model: %s", name)
+        metrics_list: List[Dict[str, float]] = []
 
-        metrics["accuracy"].append(accuracy_score(yv, pred))
-        metrics["precision"].append(
-            precision_score(yv, pred, average="binary" if is_binary else "macro")
-        )
-        metrics["recall"].append(
-            recall_score(yv, pred, average="binary" if is_binary else "macro")
-        )
-        metrics["f1"].append(
-            f1_score(yv, pred, average="binary" if is_binary else "macro")
-        )
+        # Clone to avoid cross-fold contamination
+        for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X_num, y_enc), start=1):
+            logger.info("  Fold %d/%d", fold_idx, n_splits_target)
+            if name == "CB":
+                X_train = X_cb.iloc[train_idx]
+                X_val = X_cb.iloc[val_idx]
+                y_train = y_enc.iloc[train_idx]
+                y_val = y_enc.iloc[val_idx]
 
-        try:
-            proba = model.predict_proba(Xv)
-            if is_binary:
-                auc = roc_auc_score(yv, proba[:, 1])
+                model = model_proto.__class__(**model_proto.get_params())
+                model.fit(
+                    X_train,
+                    y_train,
+                    cat_features=cat_indices if cat_indices else None,
+                )
+                y_pred = model.predict(X_val)
+                y_proba = None
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba(X_val)
+                    if is_binary and proba.shape[1] == 2:
+                        y_proba = proba[:, 1]
+                    else:
+                        y_proba = proba
             else:
-                auc = roc_auc_score(yv, proba, multi_class="ovr")
-        except Exception:
-            auc = float("nan")
+                X_train = X_num.iloc[train_idx]
+                X_val = X_num.iloc[val_idx]
+                y_train = y_enc.iloc[train_idx]
+                y_val = y_enc.iloc[val_idx]
 
-        metrics["auc"].append(auc)
+                model = model_proto.__class__(**model_proto.get_params())
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_val)
+                y_proba = None
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba(X_val)
+                    if is_binary and proba.shape[1] == 2:
+                        y_proba = proba[:, 1]
+                    else:
+                        y_proba = proba
 
-    return {k: float(np.nanmean(v)) for k, v in metrics.items()}
+            m = compute_metrics(
+                y_true=y_val.to_numpy(),
+                y_pred=y_pred,
+                y_proba=y_proba,
+                is_binary=is_binary,
+            )
+            metrics_list.append(m)
 
+        # Aggregate metrics across folds
+        agg = {
+            key: float(np.nanmean([m[key] for m in metrics_list]))
+            for key in metrics_list[0].keys()
+        }
+        agg["n_splits"] = float(n_splits_target)
+        all_results[name] = agg
+        logger.info("  CV results for %s: %s", name, agg)
 
-# =====================================================================
-# PER-TARGET TRAINING
-# =====================================================================
+        if agg["f1"] > best_f1:
+            best_f1 = agg["f1"]
+            best_model_name = name
 
+    if best_model_name is None:
+        logger.warning("No valid model for target %s", y_col)
+        return None, all_results, None
 
-def train_one_target(y_col: str) -> Optional[dict]:
-    """Train all models for a single target and return summary dict."""
-    # Switch logger to per-target
-    global log
-    log = get_target_logger(y_col)
+    logger.info("Best model for %s is %s (F1=%.4f)", y_col, best_model_name, best_f1)
 
-    df = pd.read_csv(DATA_PATH, low_memory=False)
-    id_cols, ft_cols, y_cols = detect_columns(df)
+    # Refit best model on full data for this target
+    final_models = build_models(is_binary)
+    best_model_proto = final_models[best_model_name]
 
-    if y_col not in y_cols:
-        log.warning("Column %s not recognised as y_ target. Skipping.", y_col)
-        return None
-
-    df_t = df[df[y_col].notna()].copy()
-    n_rows = len(df_t)
-    if n_rows < MIN_SAMPLES_PER_TARGET:
-        log.info(
-            "Skipping %s: only %d non-missing rows (< %d)",
-            y_col,
-            n_rows,
-            MIN_SAMPLES_PER_TARGET,
-        )
-        return None
-
-    y = df_t[y_col].astype("category").cat.codes
-    n_classes = y.nunique()
-    if n_classes < 2:
-        log.info("Skipping %s: only one class after encoding.", y_col)
-        return None
-    is_binary = n_classes == 2
-
-    selected_features = load_selected_features_for_target(y_col, ft_cols)
-    if not selected_features:
-        log.info("No selected features for %s. Skipping.", y_col)
-        return None
-
-    X = df_t[selected_features]
-    X_enc = encode_for_non_catboost(X, y)
-    X_cb, cat_cols_cb = prepare_catboost_input(X)
-
-    start_time = time.time()
-
-    # MLflow context (no-op if disabled)
-    if USE_MLFLOW_STAGE2:
-        run_ctx = mlflow.start_run(run_name=y_col)  # type: ignore
+    if best_model_name == "CB":
+        best_model = best_model_proto.__class__(**best_model_proto.get_params())
+        best_model.fit(X_cb, y_enc, cat_features=cat_indices if cat_indices else None)
     else:
-        run_ctx = nullcontext()
+        X_num_full = prepare_numeric_view_with_encoder(X)
+        best_model = best_model_proto.__class__(**best_model_proto.get_params())
+        best_model.fit(X_num_full, y_enc)
 
-    with run_ctx:
-        if USE_MLFLOW_STAGE2:
-            mlflow.log_param("target", y_col)  # type: ignore
-            mlflow.log_param("n_samples", int(n_rows))  # type: ignore
-            mlflow.log_param("n_features", len(selected_features))  # type: ignore
-            mlflow.log_param("n_classes", int(n_classes))  # type: ignore
-            mlflow.log_param("is_binary", bool(is_binary))  # type: ignore
+    return best_model_name, all_results, best_model
 
-        results: dict[str, dict] = {}
-        best_f1 = -1.0
-        best_model = None
-        best_name = None
 
-        # RF
-        rf = RandomForestClassifier(
-            n_estimators=500,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
+# ---------------------------------------------------------------------
+# PER-TARGET PIPELINE (RUN IN PARALLEL)
+# ---------------------------------------------------------------------
+
+def process_target(y_col: str, df: pd.DataFrame) -> Dict:
+    """Train and select best model for a single target."""
+    logger = get_target_logger(y_col)
+    logger.info("=== Stage-2 training for %s ===", y_col)
+
+    df_target = df[df[y_col].notna()].copy()
+    n_rows = df_target.shape[0]
+    if n_rows < 2:
+        logger.warning("Skipping %s: <2 labelled rows (%d).", y_col, n_rows)
+        return {"target": y_col, "skipped": True, "reason": "too_few_rows"}
+
+    # Load selected features
+    selected_features = load_selected_features(y_col, logger)
+    if not selected_features:
+        logger.warning("Skipping %s: no selected features.", y_col)
+        return {"target": y_col, "skipped": True, "reason": "no_selected_features"}
+
+    missing_features = [f for f in selected_features if f not in df.columns]
+    if missing_features:
+        logger.warning(
+            "Skipping %s: missing features in data: %s", y_col, missing_features
         )
-        res_rf = evaluate_model_cv(rf, X_enc, y, is_binary)
-        results["RF"] = res_rf
-        if USE_MLFLOW_STAGE2:
-            for m_name, m_val in res_rf.items():
-                mlflow.log_metric(f"RF_{m_name}", m_val)  # type: ignore
-        if res_rf["f1"] > best_f1:
-            best_f1 = res_rf["f1"]
-            best_model = rf
-            best_name = "RF"
+        return {"target": y_col, "skipped": True, "reason": "missing_features"}
 
-        # LGBM
-        lgbm = LGBMClassifier(
-            n_estimators=400,
-            learning_rate=0.05,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-            objective="binary" if is_binary else "multiclass",
-            num_class=n_classes if not is_binary else None,
-        )
-        res_lgb = evaluate_model_cv(lgbm, X_enc, y, is_binary)
-        results["LGBM"] = res_lgb
-        if USE_MLFLOW_STAGE2:
-            for m_name, m_val in res_lgb.items():
-                mlflow.log_metric(f"LGBM_{m_name}", m_val)  # type: ignore
-        if res_lgb["f1"] > best_f1:
-            best_f1 = res_lgb["f1"]
-            best_model = lgbm
-            best_name = "LGBM"
+    X = df_target[selected_features].copy()
+    y_raw = df_target[y_col]
 
-        # XGB
-        xgb = XGBClassifier(
-            n_estimators=400,
-            max_depth=7,
-            learning_rate=0.04,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-            objective="binary:logistic" if is_binary else "multi:softprob",
-            num_class=n_classes if not is_binary else None,
-        )
-        res_xgb = evaluate_model_cv(xgb, X_enc, y, is_binary)
-        results["XGB"] = res_xgb
-        if USE_MLFLOW_STAGE2:
-            for m_name, m_val in res_xgb.items():
-                mlflow.log_metric(f"XGB_{m_name}", m_val)  # type: ignore
-        if res_xgb["f1"] > best_f1:
-            best_f1 = res_xgb["f1"]
-            best_model = xgb
-            best_name = "XGB"
+    # Prepare target + dynamic n_splits
+    y_enc, le, n_splits_target = prepare_target_and_cv(
+        y_raw=y_raw,
+        max_splits=MAX_N_SPLITS,
+        logger=logger,
+    )
+    if y_enc is None:
+        return {"target": y_col, "skipped": True, "reason": "too_few_classes"}
 
-        # HGB
-        hgb = HistGradientBoostingClassifier(
-            loss="log_loss",
-            max_depth=None,
-            learning_rate=0.05,
-            max_bins=255,
-            l2_regularization=0.0,
-            random_state=RANDOM_STATE,
-        )
-        res_hgb = evaluate_model_cv(hgb, X_enc, y, is_binary)
-        results["HGB"] = res_hgb
-        if USE_MLFLOW_STAGE2:
-            for m_name, m_val in res_hgb.items():
-                mlflow.log_metric(f"HGB_{m_name}", m_val)  # type: ignore
-        if res_hgb["f1"] > best_f1:
-            best_f1 = res_hgb["f1"]
-            best_model = hgb
-            best_name = "HGB"
+    best_model_name, all_results, best_model = cross_validate_target(
+        y_col=y_col,
+        X=X,
+        y_enc=y_enc,
+        n_splits_target=n_splits_target,
+        logger=logger,
+    )
 
-        # CatBoost
-        cb = CatBoostClassifier(
-            iterations=400,
-            depth=7,
-            learning_rate=0.05,
-            random_state=RANDOM_STATE,
-            loss_function="Logloss" if is_binary else "MultiClass",
-            verbose=False,
-        )
-        res_cb = evaluate_model_cv(cb, X_cb, y, is_binary)
-        results["CB"] = res_cb
-        if USE_MLFLOW_STAGE2:
-            for m_name, m_val in res_cb.items():
-                mlflow.log_metric(f"CB_{m_name}", m_val)  # type: ignore
-        if res_cb["f1"] > best_f1:
-            best_f1 = res_cb["f1"]
-            best_model = cb
-            best_name = "CB"
+    if best_model is None or best_model_name is None:
+        return {"target": y_col, "skipped": True, "reason": "no_valid_model"}
 
-        if best_model is None:
-            log.warning("No valid model for %s.", y_col)
-            if USE_MLFLOW_STAGE2:
-                mlflow.log_param("best_model", "None")  # type: ignore
-            return None
+    # Save best model
+    model_path = TRAINED_MODELS_DIR / f"{y_col}_best.joblib"
+    joblib.dump(best_model, model_path)
+    logger.info("Saved best model for %s to %s", y_col, model_path)
 
-        elapsed = time.time() - start_time
-
-        # Retrain best model on full data
-        if best_name == "CB":
-            best_model.fit(X_cb, y)
-        else:
-            best_model.fit(X_enc, y)
-
-        MODELS_DIR.mkdir(exist_ok=True)
-        model_path = MODELS_DIR / f"{y_col}_best.joblib"
-        joblib.dump(best_model, model_path)
-
-        if USE_MLFLOW_STAGE2:
-            mlflow.log_param("best_model", best_name)  # type: ignore
-            mlflow.log_metric("best_f1", best_f1)  # type: ignore
-            mlflow.log_metric("time_sec", elapsed)  # type: ignore
-            mlflow.log_artifact(str(model_path))  # type: ignore
-
-        log.info(
-            "Finished %s -> best=%s, f1=%.4f, time=%.1fs, features=%d, samples=%d",
-            y_col,
-            best_name,
-            best_f1,
-            elapsed,
-            len(selected_features),
-            n_rows,
-        )
-
-    return {
+    # Flatten metrics for CSV/JSON
+    best_metrics = all_results[best_model_name]
+    record = {
         "target": y_col,
-        "best_model": best_name,
-        "metrics": results,
-        "time_sec": elapsed,
-        "n_features": len(selected_features),
-        "n_samples": int(n_rows),
+        "skipped": False,
+        "best_model": best_model_name,
+        "n_splits": best_metrics.get("n_splits", float(n_splits_target)),
+        "f1": best_metrics.get("f1", np.nan),
+        "precision": best_metrics.get("precision", np.nan),
+        "recall": best_metrics.get("recall", np.nan),
+        "accuracy": best_metrics.get("accuracy", np.nan),
+        "auc": best_metrics.get("auc", np.nan),
     }
+    logger.info("Final record for %s: %s", y_col, record)
+    return record
 
 
-# =====================================================================
+# ---------------------------------------------------------------------
 # MAIN
-# =====================================================================
-
+# ---------------------------------------------------------------------
 
 def main() -> None:
+    TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    log.info("Loading data from %s", DATA_PATH)
     df = pd.read_csv(DATA_PATH, low_memory=False)
-    _, _, y_cols = detect_columns(df)
+    id_cols, ft_cols, y_cols = detect_columns(df)
+    log.info(
+        "Detected %d id_, %d ft_, %d y_ columns",
+        len(id_cols),
+        len(ft_cols),
+        len(y_cols),
+    )
+
+    if not y_cols:
+        log.error("No y_ columns found. Exiting.")
+        return
 
     log.info(
-        "Stage-2: training models for %d targets (parallel=%s, workers=%d)",
+        "Starting Stage-2 training for %d targets with N_JOBS_TARGETS=%d",
         len(y_cols),
-        USE_PARALLEL_STAGE2,
         N_JOBS_TARGETS,
     )
 
-    if USE_PARALLEL_STAGE2:
-        # Parallel: faster, but tqdm can't show incremental progress (only console logs).
-        results = Parallel(n_jobs=N_JOBS_TARGETS)(
-            delayed(train_one_target)(y_col) for y_col in y_cols
-        )
+    results = Parallel(n_jobs=N_JOBS_TARGETS)(
+        delayed(process_target)(y_col, df) for y_col in y_cols
+    )
+
+    # Split into processed vs skipped
+    processed_records = [r for r in results if not r.get("skipped", False)]
+    skipped_records = [r for r in results if r.get("skipped", False)]
+
+    if processed_records:
+        df_results = pd.DataFrame(processed_records)
+        df_results.to_csv(RESULTS_CSV, index=False)
+        with open(RESULTS_JSON, "w", encoding="utf-8") as f:
+            json.dump(processed_records, f, indent=2)
+        log.info("Saved Stage-2 metrics to %s and %s", RESULTS_CSV, RESULTS_JSON)
     else:
-        # Sequential: slower, but nice tqdm progress bar.
-        results = []
-        for y_col in tqdm(y_cols, desc="Stage-2 targets"):
-            results.append(train_one_target(y_col))
+        log.warning("No targets successfully trained in Stage-2.")
 
-    results = [r for r in results if r is not None]
-    if not results:
-        log.warning("No targets were successfully trained.")
-        return
-
-    rows = []
-    for r in results:
-        best_name = r["best_model"]
-        best_metrics = r["metrics"][best_name]
-        row = {
-            "target": r["target"],
-            "best_model": best_name,
-            "time_sec": r["time_sec"],
-            "n_features": r["n_features"],
-            "n_samples": r["n_samples"],
-            "accuracy": best_metrics["accuracy"],
-            "precision": best_metrics["precision"],
-            "recall": best_metrics["recall"],
-            "f1": best_metrics["f1"],
-            "auc": best_metrics["auc"],
-        }
-        rows.append(row)
-
-    pd.DataFrame(rows).to_csv(RESULTS_CSV_PATH, index=False)
-    log.info("Saved summary CSV → %s", RESULTS_CSV_PATH)
-
-    with open(RESULTS_JSON_PATH, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    log.info("Saved full results JSON → %s", RESULTS_JSON_PATH)
+    if skipped_records:
+        df_skipped = pd.DataFrame(skipped_records)
+        df_skipped.to_csv(SKIPPED_CSV, index=False)
+        log.info("Saved skipped targets list to %s", SKIPPED_CSV)
 
 
 if __name__ == "__main__":
