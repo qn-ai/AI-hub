@@ -1,6 +1,57 @@
 #!/usr/bin/env python
-"""Stage-2: train per-target models using Stage-1 feature_importances
-with optional MLflow logging, per-target logs, and optional tqdm progress.
+"""
+Stage-2: Per-Target Model Training with Parallel Cross-Validation.
+
+This stage trains a **best model per target** using the selected features from Stage-1.
+It supports wide data, mixed feature types, missing values, and binary or multiclass targets.
+
+### Inputs
+- ``input_data.csv``: full dataset (id_, ft_, y_ columns)
+- ``feature_importances/feature_importances_<y>.csv``: Stage-1 selected features
+- Optional: ``mlflow`` tracking directory
+
+### Overview
+For each target ``y_*`` that has:
+- ≥ MIN_SAMPLES_PER_TARGET labeled rows
+- A valid feature importance file
+
+The pipeline:
+1. Loads per-target selected features and extracts the subset of rows where y_* is not missing.
+2. Builds two feature views:
+   - Encoded numeric: CatBoostEncoder → RF, LGBM, XGB, HGB
+   - Raw categorical: string NaN-filled → CatBoost
+3. Detects binary vs multiclass target.
+4. Performs K-fold cross-validation for:
+   - RandomForestClassifier
+   - LGBMClassifier
+   - XGBClassifier
+   - HistGradientBoostingClassifier
+   - CatBoostClassifier
+5. Computes evaluation metrics:
+   - F1, Recall, Precision, AUC
+   - Fit time, prediction time
+6. Selects the **best model** by mean F1 score.
+7. Saves:
+   - ``trained_models/y_<target>_best.joblib``
+   - ``model_cv_results_parallel.csv`` (metrics across all targets)
+   - Optional MLflow logging for reproducibility
+8. Writes logs to:
+   - ``logs/y_<target>_stage2.log``
+
+### Features
+- Fully NaN-aware models; encoder only affects categoricals.
+- Per-target parallel execution for speed (n_jobs configurable).
+- Supports very large numbers of targets (100+).
+- Supports 16-CPU environments with >30GB RAM on Posit Workbench.
+
+### Outputs
+- One best model per target in ``trained_models/``.
+- Aggregated CV metrics in CSV/JSON format.
+- Logs for debugging and reproducibility.
+
+### Usage
+python train_stage2.py
+make stage2
 """
 
 from __future__ import annotations
