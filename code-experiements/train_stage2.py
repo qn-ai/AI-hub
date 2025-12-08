@@ -1,33 +1,36 @@
 #!/usr/bin/env python
 """
-Stage-2: Per-Target Model Training with Dynamic CV Folds.
+Stage-2: Per-Target Model Training with Dynamic CV Folds and
+Saving One Trained Model Per Algorithm (RF, LGBM, XGB, HGB, CB).
 
-This stage trains a best model per target using features selected in Stage-1.
-It handles:
-- targets with only one label (skipped as non-learnable),
-- very imbalanced targets (dynamic n_splits based on min class count),
-- mixed feature types (numeric + categorical),
-- missing values (NaN-aware models).
+This stage:
 
-Inputs
-------
-- input_data.csv :
-    Wide table with:
-        - id_* identifier columns
-        - ft_* feature columns (numeric or object)
-        - y_* target columns (binary or multiclass)
+- Uses feature_importances_<y>.csv from Stage-1 to choose features per target.
+- For each y_*:
+    * Filters non-missing rows
+    * Checks class distribution and chooses n_splits = min(MAX_N_SPLITS, min_class_count)
+    * Skips targets with too few rows or degenerate classes
+    * Builds two feature views:
+        - Numeric (CatBoostEncoder) for RF / LGBM / XGB / HGB
+        - Raw string categorical view for CatBoost
+    * Cross-validates all 5 models and computes metrics:
+        - F1, Precision, Recall, Accuracy, AUC
+    * Selects the best model by F1
+    * Refits ALL 5 models on the full target data
+    * Saves:
+        - trained_models/y_<target>_RF.joblib
+        - trained_models/y_<target>_LGBM.joblib
+        - trained_models/y_<target>_XGB.joblib
+        - trained_models/y_<target>_HGB.joblib
+        - trained_models/y_<target>_CB.joblib
+        - trained_models/y_<target>_best.joblib (alias to best model)
 
-- feature_importances/feature_importances_<y>.csv :
-    From Stage-1, must contain:
-        feature_name, RF, LGBM, CB, XGB, HGB, mean_rank
+Outputs:
 
-Outputs
--------
-- trained_models/y_<target>_best.joblib
 - model_cv_results_parallel.csv
 - model_cv_results_parallel.json
+- skipped_targets_stage2.csv
 - logs/y_<target>_stage2.log
-- skipped_targets_stage2.csv (targets skipped with a reason)
 """
 
 from __future__ import annotations
@@ -65,6 +68,7 @@ DATA_PATH = "input_data.csv"
 FEATURE_IMPORTANCE_DIR = Path("feature_importances")
 TRAINED_MODELS_DIR = Path("trained_models")
 LOG_DIR = Path("logs")
+
 RESULTS_CSV = "model_cv_results_parallel.csv"
 RESULTS_JSON = "model_cv_results_parallel.json"
 SKIPPED_CSV = "skipped_targets_stage2.csv"
@@ -75,10 +79,9 @@ TARGET_PREFIX = "y_"
 
 RANDOM_STATE = 42
 
-# CV folds: per target n_splits = min(MAX_N_SPLITS, min_class_count)
+# dynamic CV folds: n_splits_target = min(MAX_N_SPLITS, min_class_count)
 MAX_N_SPLITS = 5
 
-# Parallelism
 _CPU = os.cpu_count() or 4
 N_JOBS_TARGETS = max(min(_CPU - 1, 12), 2)
 
@@ -104,15 +107,13 @@ def get_target_logger(y_col: str) -> logging.Logger:
     logger = logging.getLogger(f"stage2.{y_col}")
     logger.setLevel(logging.INFO)
 
-    # Attach file handler once
     if not any(
         isinstance(h, logging.FileHandler) and getattr(h, "_stage2_file", False)
         for h in logger.handlers
     ):
         fh = logging.FileHandler(LOG_DIR / f"{y_col}_stage2.log", mode="w", encoding="utf-8")
         fh._stage2_file = True  # type: ignore[attr-defined]
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        fh.setFormatter(fmt)
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         logger.addHandler(fh)
 
     logger.propagate = True
@@ -124,7 +125,6 @@ def get_target_logger(y_col: str) -> logging.Logger:
 # ---------------------------------------------------------------------
 
 def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
-    """Detect id_, ft_, y_ columns by prefix."""
     id_cols = [c for c in df.columns if c.startswith(ID_PREFIX)]
     ft_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
     y_cols = [c for c in df.columns if c.startswith(TARGET_PREFIX)]
@@ -132,7 +132,7 @@ def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
 
 
 def load_selected_features(y_col: str, logger: logging.Logger) -> List[str]:
-    """Load selected features for a target from Stage-1 combined CSV.
+    """Load selected features from Stage-1 importance file.
 
     Only keep rows where RF, LGBM, CB, XGB, HGB > 0.
     """
@@ -162,28 +162,24 @@ def prepare_target_and_cv(
     max_splits: int,
     logger: logging.Logger,
 ) -> Tuple[Optional[pd.Series], Optional[LabelEncoder], Optional[int]]:
-    """Encode target and choose n_splits based on class distribution.
+    """Encode target and determine n_splits for CV.
 
-    - Convert to string categories
+    - Convert to string
     - Compute class counts
-    - min_count = min(counts)
-    - If min_count < 2 → target is not learnable → return (None, None, None)
-    - Else n_splits_target = min(max_splits, min_count)
-    - Encode with LabelEncoder -> contiguous 0..K-1
-
-    Returns:
-        y_enc, label_encoder, n_splits_target
+    - If min class count < 2 → skip
+    - n_splits_target = min(max_splits, min_class_count)
+    - LabelEncoder for contiguous 0..K-1
     """
     y_str = y_raw.astype(str)
     counts = y_str.value_counts()
-    logger.info("Class distribution: %s", counts.to_dict())
-
     min_count = int(counts.min())
     n_classes = counts.shape[0]
 
+    logger.info("Class distribution: %s", counts.to_dict())
+
     if min_count < 2:
         logger.warning(
-            "Skipping target: min class count = %d < 2 (n_classes=%d).",
+            "Skipping target: min class count = %d < 2 (n_classes=%d)",
             min_count,
             n_classes,
         )
@@ -191,7 +187,9 @@ def prepare_target_and_cv(
 
     n_splits_target = int(min(max_splits, min_count))
     if n_splits_target < 2:
-        logger.warning("Skipping target: n_splits would be %d < 2.", n_splits_target)
+        logger.warning(
+            "Skipping target: computed n_splits=%d < 2", n_splits_target
+        )
         return None, None, None
 
     le = LabelEncoder()
@@ -222,17 +220,14 @@ def prepare_catboost_view(X: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
 
 
 def prepare_numeric_view_with_encoder(X: pd.DataFrame) -> pd.DataFrame:
-    """Prepare numeric encoded view using CatBoostEncoder on all rows.
-
-    This is an unsupervised encoding (dummy target), but consistent with Stage-3.
-    """
+    """Prepare numeric view using CatBoostEncoder (unsupervised)."""
     X_num = X.copy()
     cat_cols = X_num.select_dtypes(include=["object"]).columns.tolist()
 
     if USE_CATBOOST_ENCODER and cat_cols:
         enc = CatBoostEncoder(cols=cat_cols, random_state=RANDOM_STATE)
-        dummy_y = np.zeros(len(X_num))
-        X_num = enc.fit_transform(X_num, dummy_y)
+        dummy = np.zeros(len(X_num))
+        X_num = enc.fit_transform(X_num, dummy)
     elif not USE_CATBOOST_ENCODER and cat_cols:
         X_num = X_num.drop(columns=cat_cols)
 
@@ -241,7 +236,7 @@ def prepare_numeric_view_with_encoder(X: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_models(is_binary: bool) -> Dict[str, object]:
-    """Return dict of model_name -> estimator prototype."""
+    """Return model prototypes."""
     if is_binary:
         lgbm_obj = "binary"
         xgb_obj = "binary:logistic"
@@ -251,7 +246,7 @@ def build_models(is_binary: bool) -> Dict[str, object]:
         xgb_obj = "multi:softprob"
         cb_loss = "MultiClass"
 
-    models = {
+    return {
         "RF": RandomForestClassifier(
             n_estimators=300,
             random_state=RANDOM_STATE,
@@ -290,7 +285,6 @@ def build_models(is_binary: bool) -> Dict[str, object]:
             verbose=False,
         ),
     }
-    return models
 
 
 def compute_metrics(
@@ -299,34 +293,31 @@ def compute_metrics(
     y_proba: Optional[np.ndarray],
     is_binary: bool,
 ) -> Dict[str, float]:
-    """Compute metrics for a single fold."""
+    """Compute metrics for one fold."""
     avg = "binary" if is_binary else "macro"
-    metrics: Dict[str, float] = {}
-    metrics["accuracy"] = accuracy_score(y_true, y_pred)
-    metrics["f1"] = f1_score(y_true, y_pred, average=avg, zero_division=0)
-    metrics["precision"] = precision_score(y_true, y_pred, average=avg, zero_division=0)
-    metrics["recall"] = recall_score(y_true, y_pred, average=avg, zero_division=0)
 
-    if y_proba is not None:
-        try:
-            if is_binary:
-                # y_proba is shape (n_samples,) or (n_samples,2)
-                if y_proba.ndim == 1:
-                    metrics["auc"] = roc_auc_score(y_true, y_proba)
-                else:
-                    metrics["auc"] = roc_auc_score(y_true, y_proba[:, 1])
+    out: Dict[str, float] = {}
+    out["accuracy"] = accuracy_score(y_true, y_pred)
+    out["f1"] = f1_score(y_true, y_pred, average=avg, zero_division=0)
+    out["precision"] = precision_score(y_true, y_pred, average=avg, zero_division=0)
+    out["recall"] = recall_score(y_true, y_pred, average=avg, zero_division=0)
+
+    if y_proba is None:
+        out["auc"] = np.nan
+        return out
+
+    try:
+        if is_binary:
+            if y_proba.ndim == 1:
+                out["auc"] = roc_auc_score(y_true, y_proba)
             else:
-                metrics["auc"] = roc_auc_score(
-                    y_true,
-                    y_proba,
-                    multi_class="ovr",
-                )
-        except Exception:
-            metrics["auc"] = np.nan
-    else:
-        metrics["auc"] = np.nan
+                out["auc"] = roc_auc_score(y_true, y_proba[:, 1])
+        else:
+            out["auc"] = roc_auc_score(y_true, y_proba, multi_class="ovr")
+    except Exception:
+        out["auc"] = np.nan
 
-    return metrics
+    return out
 
 
 def cross_validate_target(
@@ -335,9 +326,15 @@ def cross_validate_target(
     y_enc: pd.Series,
     n_splits_target: int,
     logger: logging.Logger,
-) -> Tuple[Optional[str], Dict[str, Dict[str, float]], Optional[object]]:
-    """Cross-validate all models for a target and return best model name + metrics + best estimator."""
-    is_binary = y_enc.nunique() == 2
+) -> Tuple[Optional[str], Dict[str, Dict[str, float]], Dict[str, object]]:
+    """
+    Cross-validate all models for a target, return:
+
+    - best_model_name (by F1),
+    - metrics per model,
+    - dict of trained models (refit on full data for each algorithm).
+    """
+    is_binary = (y_enc.nunique() == 2)
     logger.info("Target %s is %s", y_col, "binary" if is_binary else "multiclass")
 
     cv = StratifiedKFold(
@@ -346,60 +343,52 @@ def cross_validate_target(
         random_state=RANDOM_STATE,
     )
 
-    # Prepare views
+    # Feature views
     X_num = prepare_numeric_view_with_encoder(X)
     X_cb, cat_cols = prepare_catboost_view(X)
     cat_indices = [X_cb.columns.get_loc(c) for c in cat_cols]
 
-    models = build_models(is_binary)
+    models_proto = build_models(is_binary)
     all_results: Dict[str, Dict[str, float]] = {}
     best_model_name: Optional[str] = None
-    best_f1: float = -np.inf
-    best_estimator: Optional[object] = None
+    best_f1 = -np.inf
 
-    for name, model_proto in models.items():
+    # ------ CV for each model ------
+    for name, model_p in models_proto.items():
         logger.info("CV for model: %s", name)
-        metrics_list: List[Dict[str, float]] = []
+        fold_metrics: List[Dict[str, float]] = []
 
-        # Clone to avoid cross-fold contamination
         for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X_num, y_enc), start=1):
             logger.info("  Fold %d/%d", fold_idx, n_splits_target)
             if name == "CB":
                 X_train = X_cb.iloc[train_idx]
                 X_val = X_cb.iloc[val_idx]
-                y_train = y_enc.iloc[train_idx]
-                y_val = y_enc.iloc[val_idx]
+            else:
+                X_train = X_num.iloc[train_idx]
+                X_val = X_num.iloc[val_idx]
 
-                model = model_proto.__class__(**model_proto.get_params())
+            y_train = y_enc.iloc[train_idx]
+            y_val = y_enc.iloc[val_idx]
+
+            model = model_p.__class__(**model_p.get_params())
+            if name == "CB":
                 model.fit(
                     X_train,
                     y_train,
                     cat_features=cat_indices if cat_indices else None,
                 )
-                y_pred = model.predict(X_val)
-                y_proba = None
-                if hasattr(model, "predict_proba"):
-                    proba = model.predict_proba(X_val)
-                    if is_binary and proba.shape[1] == 2:
-                        y_proba = proba[:, 1]
-                    else:
-                        y_proba = proba
             else:
-                X_train = X_num.iloc[train_idx]
-                X_val = X_num.iloc[val_idx]
-                y_train = y_enc.iloc[train_idx]
-                y_val = y_enc.iloc[val_idx]
-
-                model = model_proto.__class__(**model_proto.get_params())
                 model.fit(X_train, y_train)
-                y_pred = model.predict(X_val)
-                y_proba = None
-                if hasattr(model, "predict_proba"):
-                    proba = model.predict_proba(X_val)
-                    if is_binary and proba.shape[1] == 2:
-                        y_proba = proba[:, 1]
-                    else:
-                        y_proba = proba
+
+            y_pred = model.predict(X_val)
+
+            y_proba: Optional[np.ndarray] = None
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba(X_val)
+                if is_binary and proba.shape[1] == 2:
+                    y_proba = proba[:, 1]
+                else:
+                    y_proba = proba
 
             m = compute_metrics(
                 y_true=y_val.to_numpy(),
@@ -407,74 +396,78 @@ def cross_validate_target(
                 y_proba=y_proba,
                 is_binary=is_binary,
             )
-            metrics_list.append(m)
+            fold_metrics.append(m)
 
-        # Aggregate metrics across folds
+        # aggregate
         agg = {
-            key: float(np.nanmean([m[key] for m in metrics_list]))
-            for key in metrics_list[0].keys()
+            k: float(np.nanmean([m[k] for m in fold_metrics]))
+            for k in fold_metrics[0].keys()
         }
         agg["n_splits"] = float(n_splits_target)
         all_results[name] = agg
-        logger.info("  CV results for %s: %s", name, agg)
+        logger.info("  CV metrics for %s: %s", name, agg)
 
         if agg["f1"] > best_f1:
             best_f1 = agg["f1"]
             best_model_name = name
 
     if best_model_name is None:
-        logger.warning("No valid model for target %s", y_col)
-        return None, all_results, None
+        logger.warning("No valid model for %s", y_col)
+        return None, all_results, {}
 
     logger.info("Best model for %s is %s (F1=%.4f)", y_col, best_model_name, best_f1)
 
-    # Refit best model on full data for this target
-    final_models = build_models(is_binary)
-    best_model_proto = final_models[best_model_name]
+    # ------ Refit ALL models on full data ------
+    trained_models: Dict[str, object] = {}
+    models_proto_full = build_models(is_binary)
 
-    if best_model_name == "CB":
-        best_model = best_model_proto.__class__(**best_model_proto.get_params())
-        best_model.fit(X_cb, y_enc, cat_features=cat_indices if cat_indices else None)
-    else:
-        X_num_full = prepare_numeric_view_with_encoder(X)
-        best_model = best_model_proto.__class__(**best_model_proto.get_params())
-        best_model.fit(X_num_full, y_enc)
+    for name, model_p in models_proto_full.items():
+        logger.info("Refitting full model for %s", name)
+        model = model_p.__class__(**model_p.get_params())
+        if name == "CB":
+            model.fit(
+                X_cb,
+                y_enc,
+                cat_features=cat_indices if cat_indices else None,
+            )
+        else:
+            X_num_full = prepare_numeric_view_with_encoder(X)
+            model.fit(X_num_full, y_enc)
+        trained_models[name] = model
 
-    return best_model_name, all_results, best_model
+    return best_model_name, all_results, trained_models
 
 
 # ---------------------------------------------------------------------
-# PER-TARGET PIPELINE (RUN IN PARALLEL)
+# PER-TARGET PIPELINE
 # ---------------------------------------------------------------------
 
 def process_target(y_col: str, df: pd.DataFrame) -> Dict:
-    """Train and select best model for a single target."""
     logger = get_target_logger(y_col)
     logger.info("=== Stage-2 training for %s ===", y_col)
 
     df_target = df[df[y_col].notna()].copy()
     n_rows = df_target.shape[0]
+
     if n_rows < 2:
-        logger.warning("Skipping %s: <2 labelled rows (%d).", y_col, n_rows)
+        logger.warning("Skipping %s: <2 labelled rows.", y_col)
         return {"target": y_col, "skipped": True, "reason": "too_few_rows"}
 
-    # Load selected features
     selected_features = load_selected_features(y_col, logger)
     if not selected_features:
         logger.warning("Skipping %s: no selected features.", y_col)
         return {"target": y_col, "skipped": True, "reason": "no_selected_features"}
 
-    missing_features = [f for f in selected_features if f not in df.columns]
-    if missing_features:
+    missing = [f for f in selected_features if f not in df.columns]
+    if missing:
         logger.warning(
-            "Skipping %s: missing features in data: %s", y_col, missing_features
+            "Skipping %s: missing features in data: %s", y_col, missing
         )
         return {"target": y_col, "skipped": True, "reason": "missing_features"}
 
     X = df_target[selected_features].copy()
     y_raw = df_target[y_col]
 
-    # Prepare target + dynamic n_splits
     y_enc, le, n_splits_target = prepare_target_and_cv(
         y_raw=y_raw,
         max_splits=MAX_N_SPLITS,
@@ -483,7 +476,7 @@ def process_target(y_col: str, df: pd.DataFrame) -> Dict:
     if y_enc is None:
         return {"target": y_col, "skipped": True, "reason": "too_few_classes"}
 
-    best_model_name, all_results, best_model = cross_validate_target(
+    best_model_name, all_results, trained_models = cross_validate_target(
         y_col=y_col,
         X=X,
         y_enc=y_enc,
@@ -491,15 +484,23 @@ def process_target(y_col: str, df: pd.DataFrame) -> Dict:
         logger=logger,
     )
 
-    if best_model is None or best_model_name is None:
+    if not trained_models or best_model_name is None:
+        logger.warning("No trained models for %s", y_col)
         return {"target": y_col, "skipped": True, "reason": "no_valid_model"}
 
-    # Save best model
-    model_path = TRAINED_MODELS_DIR / f"{y_col}_best.joblib"
-    joblib.dump(best_model, model_path)
-    logger.info("Saved best model for %s to %s", y_col, model_path)
+    # ------ Save all models ------
+    for model_name, est in trained_models.items():
+        model_path = TRAINED_MODELS_DIR / f"{y_col}_{model_name}.joblib"
+        joblib.dump(est, model_path)
+        logger.info("Saved %s model for %s to %s", model_name, y_col, model_path)
 
-    # Flatten metrics for CSV/JSON
+    # alias best model
+    best_model = trained_models[best_model_name]
+    best_path = TRAINED_MODELS_DIR / f"{y_col}_best.joblib"
+    joblib.dump(best_model, best_path)
+    logger.info("Saved BEST model for %s (%s) to %s", y_col, best_model_name, best_path)
+
+    # Flatten metrics for global table
     best_metrics = all_results[best_model_name]
     record = {
         "target": y_col,
@@ -535,7 +536,7 @@ def main() -> None:
     )
 
     if not y_cols:
-        log.error("No y_ columns found. Exiting.")
+        log.error("No y_ columns found.")
         return
 
     log.info(
@@ -548,22 +549,21 @@ def main() -> None:
         delayed(process_target)(y_col, df) for y_col in y_cols
     )
 
-    # Split into processed vs skipped
-    processed_records = [r for r in results if not r.get("skipped", False)]
-    skipped_records = [r for r in results if r.get("skipped", False)]
+    processed = [r for r in results if not r.get("skipped", False)]
+    skipped = [r for r in results if r.get("skipped", False)]
 
-    if processed_records:
-        df_results = pd.DataFrame(processed_records)
-        df_results.to_csv(RESULTS_CSV, index=False)
+    if processed:
+        df_res = pd.DataFrame(processed)
+        df_res.to_csv(RESULTS_CSV, index=False)
         with open(RESULTS_JSON, "w", encoding="utf-8") as f:
-            json.dump(processed_records, f, indent=2)
+            json.dump(processed, f, indent=2)
         log.info("Saved Stage-2 metrics to %s and %s", RESULTS_CSV, RESULTS_JSON)
     else:
         log.warning("No targets successfully trained in Stage-2.")
 
-    if skipped_records:
-        df_skipped = pd.DataFrame(skipped_records)
-        df_skipped.to_csv(SKIPPED_CSV, index=False)
+    if skipped:
+        df_skip = pd.DataFrame(skipped)
+        df_skip.to_csv(SKIPPED_CSV, index=False)
         log.info("Saved skipped targets list to %s", SKIPPED_CSV)
 
 
