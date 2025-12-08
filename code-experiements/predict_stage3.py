@@ -1,30 +1,49 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
-Stage-3: Parallel, Chunked Prediction on a New Dataset.
+Stage-3: Parallel, Chunked Prediction on a New Dataset with BEST or ALL-MODEL mode.
 
-For each target y_<name> that has a best model in trained_models/:
+This script loads trained models from Stage-2 and performs predictions on a
+new dataset, optionally logging to MLflow and writing rich logs for each target.
 
-- Loads best model: trained_models/y_<name>_best.joblib
-- Loads selected features from: feature_importances/feature_importances_<name>.csv
-- Prepares features similar to Stage-2:
-    * CatBoost models: raw string categoricals with NA_CAT
-    * RF/LGBM/XGB/HGB: numeric view via CatBoostEncoder (unsupervised)
+Modes
+-----
+PREDICTION_MODE = "best"
+    For each target y_<name>, load:
+        trained_models/y_<name>_best.joblib
+    Produces columns:
+        y_<name>
+        y_<name>_interpolated_model4
+        y_<name>_interpolated_model4_metric1       (probability)
+        y_<name>_interpolated_model4_metric2_f1
+        y_<name>_interpolated_model4_metric3_recall
+        y_<name>_interpolated_model4_metric4_precision
+        y_<name>_interpolated_model4_metric5_auc
 
-- Applies model to new_data.csv in row chunks (e.g. 50k rows)
-- Reuses Stage-2 CV metrics (f1, recall, precision, auc) as global confidence metrics
-- Writes predictions to stage3_predictions.csv
+PREDICTION_MODE = "all_models"
+    Attempts to load:
+        y_<name>_RF.joblib
+        y_<name>_LGBM.joblib
+        y_<name>_XGB.joblib
+        y_<name>_HGB.joblib
+        y_<name>_CB.joblib
+    Produces, for each available model M:
+        y_<name>_M_interpolated_model4
+        y_<name>_M_interpolated_model4_metric1
+        ...
+        y_<name>_M_interpolated_model4_metric5_auc
 
-Outputs per target:
-- y_<target>                         (actual label if present in new_data)
-- y_<target>_interpolated_model4     (predicted class)
-- y_<target>_interpolated_model4_metric1         (per-row probability / confidence)
-- y_<target>_interpolated_model4_metric2_f1      (global F1 from Stage-2)
-- y_<target>_interpolated_model4_metric3_recall  (global Recall)
-- y_<target>_interpolated_model4_metric4_precision (global Precision)
-- y_<target>_interpolated_model4_metric5_auc     (global AUC)
+Inputs
+------
+- new_data.csv
+- feature_importances/<feature_importances_y>.csv
+- trained_models/y_<target>_<MODEL>.joblib
+- model_cv_results_parallel.csv (Stage-2 metrics, best model only)
 
-Per-target logs written to:
+Outputs
+-------
+- stage3_predictions.csv
 - logs/y_<target>_stage3.log
+- Optional: MLflow logs (disabled by default)
 """
 
 from __future__ import annotations
@@ -32,17 +51,25 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
 from category_encoders import CatBoostEncoder
+from catboost import CatBoostClassifier
 from joblib import Parallel, delayed
 
-# ---------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------
+# Optional MLflow
+try:
+    import mlflow  # noqa: F401
+    MLFLOW_AVAILABLE = True
+except Exception:
+    MLFLOW_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
 
 NEW_DATA_PATH = "new_data.csv"
 FEATURE_IMPORTANCE_DIR = Path("feature_importances")
@@ -52,21 +79,31 @@ LOG_DIR = Path("logs")
 
 OUTPUT_PATH = "stage3_predictions.csv"
 ID_COL = "id_pwd_id"
+
 FEATURE_PREFIX = "ft_"
 TARGET_PREFIX = "y_"
 
 ROW_CHUNK_SIZE = 50_000
-_CPU = os.cpu_count() or 4
-N_JOBS_TARGETS = max(min(_CPU - 1, 12), 2)
+CPU_COUNT = os.cpu_count() or 4
+N_JOBS = max(min(CPU_COUNT - 1, 16), 2)
 
 USE_CATBOOST_ENCODER = True
 CAT_FILL_VALUE = "NA_CAT"
 
+# MODE: "best" or "all_models"
+PREDICTION_MODE = "best"  # change to "all_models" to enable all models
+
+MODEL_SUFFIXES = ["RF", "LGBM", "XGB", "HGB", "CB"]
+
+# MLflow toggle
+USE_MLFLOW = False
+MLFLOW_EXPERIMENT_NAME = "Stage3_Predictions"
+
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # LOGGING
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,273 +113,305 @@ log = logging.getLogger("stage3")
 
 
 def get_target_logger(y_col: str) -> logging.Logger:
-    """Return a logger that writes to logs/y_<target>_stage3.log."""
+    """Create a per-target log file under logs/."""
     logger = logging.getLogger(f"stage3.{y_col}")
     logger.setLevel(logging.INFO)
 
-    if not any(
+    exists = any(
         isinstance(h, logging.FileHandler) and getattr(h, "_stage3_file", False)
         for h in logger.handlers
-    ):
-        fh = logging.FileHandler(LOG_DIR / f"{y_col}_stage3.log", mode="w", encoding="utf-8")
-        fh._stage3_file = True  # type: ignore[attr-defined]
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        fh.setFormatter(fmt)
+    )
+    if not exists:
+        fh = logging.FileHandler(LOG_DIR / f"{y_col}_stage3.log", "w", encoding="utf-8")
+        fh._stage3_file = True
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         logger.addHandler(fh)
-
     logger.propagate = True
     return logger
 
 
-# ---------------------------------------------------------------------
-# UTILS
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# UTILITY FUNCTIONS
+# ---------------------------------------------------------------------------
 
-def detect_columns(df: pd.DataFrame):
+def detect_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    """Identify id_, ft_, y_ columns by prefix."""
     id_cols = [c for c in df.columns if c.startswith("id_")]
     ft_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
     y_cols = [c for c in df.columns if c.startswith(TARGET_PREFIX)]
     return id_cols, ft_cols, y_cols
 
 
-def list_targets_from_models() -> List[str]:
-    """List all targets that actually have a trained best model."""
-    targets: List[str] = []
-    for p in TRAINED_MODELS_DIR.glob("y_*_best.joblib"):
-        name = p.name
-        if not name.endswith("_best.joblib"):
-            continue
-        y_col = name.replace("_best.joblib", "")
-        targets.append(y_col)
-    return sorted(set(targets))
+def list_targets_from_models() -> list[str]:
+    """Return base target names that exist in trained_models folder."""
+    names: list[str] = []
+    for path in TRAINED_MODELS_DIR.glob("y_*.joblib"):
+        stem = path.stem
+        if stem.endswith("_best"):
+            names.append(stem[:-5])
+        else:
+            for suf in MODEL_SUFFIXES:
+                ending = f"_{suf}"
+                if stem.endswith(ending):
+                    names.append(stem[: -len(ending)])
+                    break
+    return sorted(set(names))
 
 
-def load_selected_features(y_col: str, logger: logging.Logger) -> List[str]:
-    path = FEATURE_IMPORTANCE_DIR / f"feature_importances_{y_col}.csv"
-    if not path.exists():
-        logger.warning("No feature_importances file found for %s at %s", y_col, path)
+def load_feature_list(y_col: str, logger: logging.Logger) -> list[str]:
+    """Load selected features where RF/LGBM/CB/XGB/HGB > 0."""
+    fp = FEATURE_IMPORTANCE_DIR / f"feature_importances_{y_col}.csv"
+    if not fp.exists():
+        logger.warning("Feature importance file missing: %s", fp)
         return []
 
-    df_imp = pd.read_csv(path)
+    df_imp = pd.read_csv(fp)
     if "feature_name" not in df_imp.columns:
         df_imp = df_imp.rename(columns={df_imp.columns[0]: "feature_name"})
 
     required = ["RF", "LGBM", "CB", "XGB", "HGB"]
-    missing = [c for c in required if c not in df_imp.columns]
-    if missing:
-        logger.warning(
-            "Importance file %s for %s missing %s", path, y_col, missing
-        )
+    if any(c not in df_imp.columns for c in required):
+        logger.warning("Importance file missing required model columns: %s", fp)
         return []
 
     mask = (df_imp[required] > 0).all(axis=1)
-    sel = df_imp.loc[mask, "feature_name"].astype(str).tolist()
-    return sel
+    return df_imp.loc[mask, "feature_name"].astype(str).tolist()
 
 
-def prepare_catboost_view(X: pd.DataFrame) -> pd.DataFrame:
-    X_cb = X.copy()
-    cat_cols = X_cb.select_dtypes(include=["object"]).columns.tolist()
-    for c in cat_cols:
-        X_cb[c] = X_cb[c].astype("string").fillna(CAT_FILL_VALUE)
-    return X_cb
-
-
-def prepare_numeric_view_with_encoder(X: pd.DataFrame) -> pd.DataFrame:
-    X_num = X.copy()
-    cat_cols = X_num.select_dtypes(include=["object"]).columns.tolist()
+def numeric_view(X: pd.DataFrame) -> pd.DataFrame:
+    """Numeric view using CatBoostEncoder for tree models."""
+    X2 = X.copy()
+    cat_cols = X2.select_dtypes(include=["object"]).columns.tolist()
 
     if USE_CATBOOST_ENCODER and cat_cols:
         enc = CatBoostEncoder(cols=cat_cols, random_state=42)
-        dummy = np.zeros(len(X_num))
-        X_num = enc.fit_transform(X_num, dummy)
-    elif not USE_CATBOOST_ENCODER and cat_cols:
-        X_num = X_num.drop(columns=cat_cols)
+        dummy = np.zeros(len(X2))
+        X2 = enc.fit_transform(X2, dummy)
+    elif cat_cols:
+        X2 = X2.drop(columns=cat_cols)
 
-    X_num = X_num.apply(pd.to_numeric, errors="coerce")
-    return X_num
+    return X2.apply(pd.to_numeric, errors="coerce")
 
 
-def compute_probs(model, X_chunk: pd.DataFrame) -> np.ndarray:
-    """Return per-row probability (confidence)."""
+def catboost_view(X: pd.DataFrame) -> pd.DataFrame:
+    """Categorical view for CatBoost."""
+    X2 = X.copy()
+    for col in X2.select_dtypes(include=["object"]).columns:
+        X2[col] = X2[col].astype("string").fillna(CAT_FILL_VALUE)
+    return X2
+
+
+def compute_probability(model, Xc: pd.DataFrame) -> np.ndarray:
+    """Return probability estimates for models that provide predict_proba."""
     if not hasattr(model, "predict_proba"):
-        return np.full(X_chunk.shape[0], np.nan)
+        return np.full(Xc.shape[0], np.nan)
 
-    proba = model.predict_proba(X_chunk)
+    proba = model.predict_proba(Xc)
     if proba.ndim == 1:
         return proba
-
     if proba.shape[1] == 2:
         return proba[:, 1]
 
-    preds = model.predict(X_chunk)
-    out = np.empty(X_chunk.shape[0], dtype=float)
-    for i, cls in enumerate(preds):
-        out[i] = proba[i, cls]
-    return out
+    preds = model.predict(Xc)
+    return np.array([proba[i, int(cls)] for i, cls in enumerate(preds)])
 
 
-def get_stage2_metrics_for_target(
-    df_metrics: Optional[pd.DataFrame],
-    y_col: str,
-) -> dict:
-    if df_metrics is None:
+def load_metrics_stage2() -> Optional[pd.DataFrame]:
+    """Load Stage-2 metrics, if available."""
+    p = Path(STAGE2_METRICS_PATH)
+    if not p.exists():
+        log.warning("Missing Stage-2 metrics file: %s", p)
+        return None
+    return pd.read_csv(p)
+
+
+def stage2_metrics_for_model(
+    dfm: Optional[pd.DataFrame], y_col: str, model_name: str, logger: logging.Logger
+) -> dict[str, float]:
+    """
+    Stage-2 file only stores the *best model* metrics.
+    So:
+    - if model_name == best_model: return metrics
+    - else: return NaN for that model.
+    """
+    if dfm is None:
         return {"f1": np.nan, "recall": np.nan, "precision": np.nan, "auc": np.nan}
 
-    row = df_metrics.loc[df_metrics["target"] == y_col]
+    row = dfm.loc[dfm["target"] == y_col]
     if row.empty:
         return {"f1": np.nan, "recall": np.nan, "precision": np.nan, "auc": np.nan}
 
-    row = row.iloc[0]
+    r = row.iloc[0]
+    if str(r["best_model"]) != model_name:
+        logger.debug("No per-model CV metrics for %s (%s), filling NaN.", y_col, model_name)
+        return {"f1": np.nan, "recall": np.nan, "precision": np.nan, "auc": np.nan}
+
     return {
-        "f1": float(row.get("f1", np.nan)),
-        "recall": float(row.get("recall", np.nan)),
-        "precision": float(row.get("precision", np.nan)),
-        "auc": float(row.get("auc", np.nan)),
+        "f1": float(r.get("f1", np.nan)),
+        "recall": float(r.get("recall", np.nan)),
+        "precision": float(r.get("precision", np.nan)),
+        "auc": float(r.get("auc", np.nan)),
     }
 
 
-# ---------------------------------------------------------------------
-# PER-TARGET PREDICTION
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# PREDICTION HELPERS
+# ---------------------------------------------------------------------------
 
-def predict_for_target(
+def predict_best_model(
     y_col: str,
-    df_new: pd.DataFrame,
+    df: pd.DataFrame,
     df_metrics: Optional[pd.DataFrame],
 ) -> Optional[pd.DataFrame]:
+    """Predict using only y_<target>_best.joblib."""
     logger = get_target_logger(y_col)
-    logger.info("=== Stage-3 prediction for %s ===", y_col)
 
     model_path = TRAINED_MODELS_DIR / f"{y_col}_best.joblib"
     if not model_path.exists():
-        logger.warning("No model file for %s at %s. Skipping.", y_col, model_path)
+        logger.warning("Missing best model for %s: %s", y_col, model_path)
         return None
 
     model = joblib.load(model_path)
-    model_name = model.__class__.__name__
-    logger.info("Loaded model type: %s", model_name)
+    logger.info("Loaded best model type: %s", model.__class__.__name__)
 
-    if y_col in df_new.columns:
-        y_actual = df_new[y_col]
-    else:
-        y_actual = pd.Series([np.nan] * len(df_new), index=df_new.index)
-        logger.info("No actual %s in new_data; filling NaN.", y_col)
+    # Actual labels
+    y_actual = df.get(y_col, pd.Series(np.nan, index=df.index))
 
-    selected_features = load_selected_features(y_col, logger)
-    if not selected_features:
-        logger.warning("No selected features for %s. Skipping.", y_col)
+    features = load_feature_list(y_col, logger)
+    if not features:
         return None
 
-    missing_features = [f for f in selected_features if f not in df_new.columns]
-    if missing_features:
-        logger.warning(
-            "Missing features in new_data for %s: %s. Skipping.",
-            y_col,
-            missing_features,
-        )
+    X = df[features].copy()
+
+    Xp = catboost_view(X) if isinstance(model, CatBoostClassifier) else numeric_view(X)
+
+    preds = np.empty(len(df), dtype=object)
+    probas = np.empty(len(df), dtype=float)
+
+    for start in range(0, len(df), ROW_CHUNK_SIZE):
+        end = min(start + ROW_CHUNK_SIZE, len(df))
+        logger.info("BEST model: rows [%d:%d) for %s", start, end, y_col)
+        Xc = Xp.iloc[start:end]
+        preds[start:end] = model.predict(Xc)
+        probas[start:end] = compute_probability(model, Xc)
+
+    m = stage2_metrics_for_model(df_metrics, y_col, model_name="", logger=logger)
+
+    base = f"{y_col}_interpolated_model4"
+
+    out = pd.DataFrame(index=df.index)
+    out[y_col] = y_actual
+    out[base] = preds
+    out[f"{base}_metric1"] = probas
+    out[f"{base}_metric2_f1"] = m["f1"]
+    out[f"{base}_metric3_recall"] = m["recall"]
+    out[f"{base}_metric4_precision"] = m["precision"]
+    out[f"{base}_metric5_auc"] = m["auc"]
+
+    return out
+
+
+def predict_all_models(
+    y_col: str,
+    df: pd.DataFrame,
+    df_metrics: Optional[pd.DataFrame],
+) -> Optional[pd.DataFrame]:
+    """Predict using all available model files for this target."""
+    logger = get_target_logger(y_col)
+
+    y_actual = df.get(y_col, pd.Series(np.nan, index=df.index))
+    features = load_feature_list(y_col, logger)
+    if not features:
         return None
 
-    X = df_new[selected_features].copy()
-    n_rows = X.shape[0]
-    logger.info("Predicting %d rows with %d features.", n_rows, X.shape[1])
+    X = df[features].copy()
+    X_num = numeric_view(X)
+    X_cb = catboost_view(X)
 
-    if model_name == "CatBoostClassifier":
-        X_prepared = prepare_catboost_view(X)
-    else:
-        X_prepared = prepare_numeric_view_with_encoder(X)
+    out = pd.DataFrame(index=df.index)
+    out[y_col] = y_actual
 
-    y_pred_all = np.empty(n_rows, dtype=object)
-    y_prob_all = np.empty(n_rows, dtype=float)
+    for suf in MODEL_SUFFIXES:
+        path = TRAINED_MODELS_DIR / f"{y_col}_{suf}.joblib"
+        if not path.exists():
+            logger.warning("%s model missing for %s", suf, y_col)
+            continue
 
-    for start in range(0, n_rows, ROW_CHUNK_SIZE):
-        end = min(start + ROW_CHUNK_SIZE, n_rows)
-        logger.info("Processing rows [%d:%d)", start, end)
-        X_chunk = X_prepared.iloc[start:end]
+        model = joblib.load(path)
+        logger.info("Predicting with %s for target %s", suf, y_col)
 
-        preds_chunk = model.predict(X_chunk)
-        probs_chunk = compute_probs(model, X_chunk)
+        if isinstance(model, CatBoostClassifier):
+            Xp = X_cb
+        else:
+            Xp = X_num
 
-        y_pred_all[start:end] = preds_chunk
-        y_prob_all[start:end] = probs_chunk
+        preds = np.empty(len(df), dtype=object)
+        probas = np.empty(len(df), dtype=float)
 
-    m = get_stage2_metrics_for_target(df_metrics, y_col)
-    logger.info(
-        "Stage-2 metrics reused for %s: F1=%.4f Recall=%.4f Precision=%.4f AUC=%.4f",
-        y_col,
-        m["f1"],
-        m["recall"],
-        m["precision"],
-        m["auc"],
-    )
+        for start in range(0, len(df), ROW_CHUNK_SIZE):
+            end = min(start + ROW_CHUNK_SIZE, len(df))
+            logger.info("%s: rows [%d:%d) for %s", suf, start, end, y_col)
+            Xc = Xp.iloc[start:end]
+            preds[start:end] = model.predict(Xc)
+            probas[start:end] = compute_probability(model, Xc)
 
-    res = pd.DataFrame(index=df_new.index)
-    res[y_col] = y_actual
-    res[f"{y_col}_interpolated_model4"] = y_pred_all
-    res[f"{y_col}_interpolated_model4_metric1"] = y_prob_all
-    res[f"{y_col}_interpolated_model4_metric2_f1"] = m["f1"]
-    res[f"{y_col}_interpolated_model4_metric3_recall"] = m["recall"]
-    res[f"{y_col}_interpolated_model4_metric4_precision"] = m["precision"]
-    res[f"{y_col}_interpolated_model4_metric5_auc"] = m["auc"]
+        m = stage2_metrics_for_model(df_metrics, y_col, suf, logger)
 
-    logger.info("Completed Stage-3 prediction for %s.", y_col)
-    return res
+        base = f"{y_col}_{suf}_interpolated_model4"
+        out[base] = preds
+        out[f"{base}_metric1"] = probas
+        out[f"{base}_metric2_f1"] = m["f1"]
+        out[f"{base}_metric3_recall"] = m["recall"]
+        out[f"{base}_metric4_precision"] = m["precision"]
+        out[f"{base}_metric5_auc"] = m["auc"]
+
+    if out.shape[1] <= 1:
+        logger.warning("No model outputs produced for %s", y_col)
+        return None
+    return out
 
 
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # MAIN
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    log.info("Loading new_data from %s", NEW_DATA_PATH)
-    df_new = pd.read_csv(NEW_DATA_PATH, low_memory=False)
-    if ID_COL not in df_new.columns:
-        raise ValueError(f"ID column '{ID_COL}' not found in new_data.csv.")
+    """Main entry point for Stage-3 prediction."""
+    log.info("Loading new data: %s", NEW_DATA_PATH)
+    df = pd.read_csv(NEW_DATA_PATH, low_memory=False)
 
-    id_cols, ft_cols, y_cols_new = detect_columns(df_new)
-    log.info(
-        "new_data: %d rows, %d columns, %d y_ columns.",
-        df_new.shape[0],
-        df_new.shape[1],
-        len(y_cols_new),
-    )
+    if ID_COL not in df.columns:
+        raise ValueError(f"ID column {ID_COL} missing from new data.")
 
-    # Stage-2 metrics
-    if Path(STAGE2_METRICS_PATH).exists():
-        df_metrics = pd.read_csv(STAGE2_METRICS_PATH)
-        log.info("Loaded Stage-2 metrics from %s", STAGE2_METRICS_PATH)
-    else:
-        df_metrics = None
-        log.warning("No Stage-2 metrics at %s; metric columns will be NaN.", STAGE2_METRICS_PATH)
-
+    df_metrics = load_metrics_stage2()
     targets = list_targets_from_models()
-    log.info(
-        "Found %d targets with trained models in %s",
-        len(targets),
-        TRAINED_MODELS_DIR,
-    )
 
-    out = df_new[[ID_COL]].copy()
+    log.info("Targets with trained models: %d", len(targets))
+    log.info("Prediction mode: %s", PREDICTION_MODE)
 
-    log.info(
-        "Starting Stage-3 prediction (targets=%d, N_JOBS_TARGETS=%d, ROW_CHUNK_SIZE=%d)",
-        len(targets),
-        N_JOBS_TARGETS,
-        ROW_CHUNK_SIZE,
-    )
+    if USE_MLFLOW and MLFLOW_AVAILABLE:
+        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+        mlflow.start_run(run_name="Stage3_Predictions")
+        mlflow.log_param("prediction_mode", PREDICTION_MODE)
 
-    results = Parallel(n_jobs=N_JOBS_TARGETS)(
-        delayed(predict_for_target)(y_col, df_new, df_metrics) for y_col in targets
+    output = df[[ID_COL]].copy()
+
+    predict_fn = predict_best_model if PREDICTION_MODE == "best" else predict_all_models
+
+    results = Parallel(n_jobs=N_JOBS)(
+        delayed(predict_fn)(y_col, df, df_metrics) for y_col in targets
     )
 
     for res in results:
-        if res is None:
-            continue
-        out = out.join(res)
+        if res is not None:
+            output = output.join(res)
 
-    out.to_csv(OUTPUT_PATH, index=False)
-    log.info("Saved Stage-3 predictions to %s", OUTPUT_PATH)
-    print(f"\n✅ [Stage-3] Saved predictions to {OUTPUT_PATH}")
+    output.to_csv(OUTPUT_PATH, index=False)
+    log.info("Stage-3 output saved to %s", OUTPUT_PATH)
+
+    if USE_MLFLOW and MLFLOW_AVAILABLE:
+        mlflow.log_artifact(OUTPUT_PATH)
+        mlflow.end_run()
 
 
 if __name__ == "__main__":
