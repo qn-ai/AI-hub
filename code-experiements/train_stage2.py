@@ -49,18 +49,14 @@ This script:
             - Uses KFold with dynamic n_splits:
                 n_splits = min(MAX_N_SPLITS_REGRESSION, n_samples)
                 (must be >= 2).
-            - Cross-validates one or more regression models (configurable):
+            - Cross-validates regression models (currently only):
                 * RF_REG   → RandomForestRegressor
-                * LGBM_REG → LGBMRegressor
-                * XGB_REG  → XGBRegressor
-                * HGB_REG  → HistGradientBoostingRegressor
-                * CB_REG   → CatBoostRegressor
             - Computes metrics:
                 RMSE, MAE, R2.
             - Selects best model by lowest RMSE.
-            - Refits all selected regression models on full data.
+            - Refits RF_REG on full data.
             - Saves:
-                trained_models/y_<target>_<MODEL>.joblib for each enabled model
+                trained_models/y_<target>_RF_REG.joblib
                 trained_models/y_<target>_best.joblib (best model alias)
 
 Outputs:
@@ -88,7 +84,7 @@ import pandas as pd
 from category_encoders import CatBoostEncoder
 from catboost import CatBoostClassifier, CatBoostRegressor
 from joblib import Parallel, delayed, dump, load
-from lightgbm import LGBMClassifier, LGBMRegressor
+from lightgbm import LGBMClassifier
 from sklearn.ensemble import (
     HistGradientBoostingClassifier,
     HistGradientBoostingRegressor,
@@ -110,7 +106,7 @@ from xgboost import XGBClassifier, XGBRegressor
 
 # Optional MLflow
 try:
-    import mlflow  # type: ignore[import]
+    import mlflow
 
     mlflow_available = True
 except Exception:  # pragma: no cover - optional
@@ -121,7 +117,7 @@ except Exception:  # pragma: no cover - optional
 # CONFIG
 # ---------------------------------------------------------------------------
 
-# Global task mode (mirror Stage-1):
+# Global task mode (must match Stage-1):
 #   "classification" → all targets treated as classification
 #   "regression"     → all targets treated as regression (numeric only)
 TASK_MODE = "classification"  # or "regression"
@@ -140,7 +136,9 @@ random_state = 42
 min_samples_per_target = 200
 min_class_count_for_training = 2  # classification
 
-# Regression unique-values threshold (same as Stage-1)
+# Regression unique-values threshold (same as Stage-1).
+# Numeric targets with <= this many unique values are treated as
+# unsuitable for regression and are skipped.
 REGRESSION_MIN_UNIQUE = 10
 
 max_n_splits_classification = 5
@@ -152,9 +150,8 @@ n_jobs_targets = max(min(cpu_count - 1, 16), 2)
 use_catboost_encoder = True
 cat_fill_value = "NA_CAT"
 
-# Regression model choices (you can change this list)
-# Allowed keys: "RF_REG", "LGBM_REG", "XGB_REG", "HGB_REG", "CB_REG"
-REGRESSION_MODELS: List[str] = ["RF_REG"]
+# Only RF_REG is enabled for regression for now.
+enabled_regression_models: List[str] = ["RF_REG"]
 
 # MLflow
 use_mlflow = False
@@ -208,6 +205,7 @@ def get_target_logger(y_col: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 # UTILITIES
 # ---------------------------------------------------------------------------
+
 
 def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
     """Detect id_, ft_, y_ columns by prefix."""
@@ -320,7 +318,10 @@ def prepare_view_regression(
     return numeric
 
 
-def choose_stratified_cv(y: pd.Series, logger: logging.Logger) -> Optional[StratifiedKFold]:
+def choose_stratified_cv(
+    y: pd.Series,
+    logger: logging.Logger,
+) -> Optional[StratifiedKFold]:
     """Choose dynamic StratifiedKFold for classification based on class counts."""
     counts = y.value_counts()
     min_count = int(counts.min())
@@ -371,6 +372,7 @@ def choose_kfold_regression(
 # ---------------------------------------------------------------------------
 # MODEL BUILDERS
 # ---------------------------------------------------------------------------
+
 
 def build_classification_models(is_binary: bool) -> Dict[str, object]:
     """Build classification models (RF, LGBM, XGB, HGB, CB)."""
@@ -428,56 +430,21 @@ def build_classification_models(is_binary: bool) -> Dict[str, object]:
 
 
 def build_regression_models() -> Dict[str, object]:
-    """Build regression models according to REGRESSION_MODELS."""
+    """Build regression models (currently only RF_REG)."""
     models: Dict[str, object] = {}
-
-    if "RF_REG" in REGRESSION_MODELS:
+    if "RF_REG" in enabled_regression_models:
         models["RF_REG"] = RandomForestRegressor(
             n_estimators=300,
             random_state=random_state,
             n_jobs=-1,
         )
-    if "LGBM_REG" in REGRESSION_MODELS:
-        models["LGBM_REG"] = LGBMRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=random_state,
-            n_jobs=-1,
-        )
-    if "XGB_REG" in REGRESSION_MODELS:
-        models["XGB_REG"] = XGBRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=6,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            tree_method="hist",
-            random_state=random_state,
-            n_jobs=-1,
-        )
-    if "HGB_REG" in REGRESSION_MODELS:
-        models["HGB_REG"] = HistGradientBoostingRegressor(
-            max_depth=None,
-            random_state=random_state,
-        )
-    if "CB_REG" in REGRESSION_MODELS:
-        models["CB_REG"] = CatBoostRegressor(
-            iterations=300,
-            depth=6,
-            learning_rate=0.05,
-            loss_function="RMSE",
-            random_state=random_state,
-            verbose=False,
-        )
-
     return models
 
 
 # ---------------------------------------------------------------------------
 # CV EVALUATION HELPERS
 # ---------------------------------------------------------------------------
+
 
 def eval_classification_model_cv(
     name: str,
@@ -552,9 +519,7 @@ def eval_classification_model_cv(
 
         try:
             if is_binary:
-                auc_scores.append(
-                    roc_auc_score(y_val, proba[:, 1]),
-                )
+                auc_scores.append(roc_auc_score(y_val, proba[:, 1]))
             else:
                 auc_scores.append(
                     roc_auc_score(y_val, proba, multi_class="ovr"),
@@ -583,7 +548,7 @@ def eval_regression_model_cv(
     y: pd.Series,
     cv: KFold,
 ) -> Dict[str, float]:
-    """Cross-validate one regression model."""
+    """Cross-validate one regression model (currently RF_REG only)."""
     rmse_scores: List[float] = []
     mae_scores: List[float] = []
     r2_scores: List[float] = []
@@ -594,23 +559,15 @@ def eval_regression_model_cv(
         y_train = y.iloc[train_idx]
         y_val = y.iloc[val_idx]
 
-        if name == "RF_REG":
-            model = RandomForestRegressor(**model_proto.get_params())
-        elif name == "LGBM_REG":
-            model = LGBMRegressor(**model_proto.get_params())
-        elif name == "XGB_REG":
-            model = XGBRegressor(**model_proto.get_params())
-        elif name == "HGB_REG":
-            model = HistGradientBoostingRegressor(**model_proto.get_params())
-        elif name == "CB_REG":
-            model = CatBoostRegressor(**model_proto.get_params())
-        else:
-            raise ValueError(f"Unknown regression model name: {name}")
+        if name != "RF_REG":
+            raise ValueError(f"Unexpected regression model {name}")
 
+        model = RandomForestRegressor(**model_proto.get_params())
         model.fit(X_train, y_train)
         y_pred = model.predict(X_val)
 
-        rmse_scores.append(mean_squared_error(y_val, y_pred, squared=False))
+        mse = mean_squared_error(y_val, y_pred)
+        rmse_scores.append(float(np.sqrt(mse)))
         mae_scores.append(mean_absolute_error(y_val, y_pred))
         r2_scores.append(r2_score(y_val, y_pred))
 
@@ -624,6 +581,7 @@ def eval_regression_model_cv(
 # ---------------------------------------------------------------------------
 # PER-TARGET PROCESSING
 # ---------------------------------------------------------------------------
+
 
 def process_target(
     y_col: str,
@@ -671,7 +629,7 @@ def process_target(
             logger.warning(
                 (
                     "Skipping %s: only %d unique numeric values (<= %d); "
-                    "treated as categorical, not regression."
+                    "treated as unsuitable for regression."
                 ),
                 y_col,
                 nunique,
@@ -721,7 +679,7 @@ def process_target(
             }
 
     else:
-        # classification
+        # Classification
         y = y_raw.astype(str)
         counts = y.value_counts()
         n_classes = counts.shape[0]
@@ -812,12 +770,13 @@ def process_target(
         mlflow.log_param("selected_features", ",".join(all_features))
 
     if TASK_MODE == "regression":
-        # -------- Regression branch --------
+        # ---------------- Regression branch (RF_REG only) ----------------
         X_num = prepare_view_regression(X, y)
         models = build_regression_models()
         if not models:
             logger.warning(
-                "No regression models enabled in REGRESSION_MODELS; skipping %s.",
+                "No regression models enabled in enabled_regression_models; "
+                "skipping %s.",
                 y_col,
             )
             return {
@@ -840,7 +799,7 @@ def process_target(
             model_metrics[name] = metrics
             logger.info("CV metrics for %s on %s: %s", name, y_col, metrics)
 
-        # Best by lowest RMSE
+        # Best by lowest RMSE (only RF_REG currently).
         best_name = min(
             model_metrics.items(),
             key=lambda kv: kv[1]["rmse"],
@@ -849,27 +808,16 @@ def process_target(
 
         fitted_paths: Dict[str, str] = {}
 
-        for name, proto in models.items():
-            if name == "RF_REG":
-                model = RandomForestRegressor(**proto.get_params())
-            elif name == "LGBM_REG":
-                model = LGBMRegressor(**proto.get_params())
-            elif name == "XGB_REG":
-                model = XGBRegressor(**proto.get_params())
-            elif name == "HGB_REG":
-                model = HistGradientBoostingRegressor(**proto.get_params())
-            elif name == "CB_REG":
-                model = CatBoostRegressor(**proto.get_params())
-            else:
-                continue
+        # Fit RF_REG on full data.
+        proto = models["RF_REG"]
+        model = RandomForestRegressor(**proto.get_params())
+        model.fit(X_num, y)
+        out_path = models_dir / f"{y_col}_RF_REG.joblib"
+        dump(model, out_path)
+        fitted_paths["RF_REG"] = str(out_path)
+        logger.info("Saved regression model RF_REG for %s to %s", y_col, out_path)
 
-            model.fit(X_num, y)
-            out_path = models_dir / f"{y_col}_{name}.joblib"
-            dump(model, out_path)
-            fitted_paths[name] = str(out_path)
-            logger.info("Saved regression model %s for %s to %s", name, y_col, out_path)
-
-        # Best model alias
+        # Best model alias (RF_REG).
         best_src_path = fitted_paths[best_name]
         best_model = load(best_src_path)
         best_path = models_dir / f"{y_col}_best.joblib"
@@ -897,7 +845,7 @@ def process_target(
             **flat_metrics,
         }
 
-    # -------- Classification branch --------
+    # ---------------- Classification branch ----------------
     X_num, X_cb = prepare_views_classification(X, y)
     models = build_classification_models(is_binary=y.nunique() == 2)
 
@@ -986,6 +934,7 @@ def process_target(
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     """Run Stage-2 training over all y_* targets."""
