@@ -6,34 +6,46 @@ NaNs, mixed feature types, and CatBoost-compatible categorical treatment.
 This script:
 
 - Loops through all y_* targets.
-- Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
-- Skips targets with only one class, or smallest class
-  < MIN_CLASS_COUNT_FOR_IMPORTANCE.
+- In classification mode:
+    * Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
+    * Skips targets with only one class, or smallest class
+      < MIN_CLASS_COUNT_FOR_IMPORTANCE.
+- In regression mode:
+    * Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
+    * Skips non-numeric targets.
 - Cleans features globally (variance + correlation) and
   per-target (missing thresholds).
 - Builds two feature views per target:
     * Numeric view:
-        - CatBoostEncoder → numeric + NaN (rf/lgbm/xgb/hgb/rf_reg).
+        - CatBoostEncoder → numeric + NaN
+          (rf/lgbm/xgb/hgb for classification, rf_reg for regression).
     * CatBoost raw view:
-        - string categoricals + NaN → "NA_CAT" (for CatBoost).
-- Trains NaN-aware models (configurable), identified by lowercase keys:
-    * "rf"      → RandomForestClassifier
-    * "rf_reg"  → RandomForestRegressor
-    * "lgbm"    → LGBMClassifier
-    * "xgb"     → XGBClassifier
-    * "hgb"     → HistGradientBoostingClassifier
-    * "cb"      → CatBoostClassifier
+        - string categoricals + NaN → "NA_CAT" (for CatBoost in classification).
+- Trains NaN-aware models (configurable via enabled_models), identified by
+  lowercase keys:
+    Classification targets (TASK_MODE = "classification"):
+        * "rf"   → RandomForestClassifier
+        * "lgbm" → LGBMClassifier
+        * "xgb"  → XGBClassifier
+        * "hgb"  → HistGradientBoostingClassifier
+        * "cb"   → CatBoostClassifier
+    Regression targets (TASK_MODE = "regression"):
+        * "rf_reg" → RandomForestRegressor
 - Extracts feature importances per model:
-    * rf / rf_reg: feature_importances_
-    * lgbm: feature_importances_
-    * xgb: booster.get_score mapped to feature names
-    * hgb: sklearn.inspection.permutation_importance
-    * cb: model.get_feature_importance()
+    Classification:
+        * rf: feature_importances_
+        * lgbm: feature_importances_
+        * xgb: booster.get_score mapped to feature names
+        * hgb: sklearn.inspection.permutation_importance
+        * cb: model.get_feature_importance()
+    Regression:
+        * rf_reg: feature_importances_
 - Saves:
     feature_importances/feature_importances_<y>.csv with columns:
         feature_name, <one column per enabled model>, mean_rank
       where column names are upper-case aliases:
-        RF, RF_REG, LGBM, XGB, HGB, CB (only for enabled models).
+        RF, LGBM, XGB, HGB, CB for classification targets
+        RF_REG (plus mean_rank) for regression targets.
 - Skipped targets saved to:
     feature_importances/skipped_targets_stage1.csv
 
@@ -41,15 +53,21 @@ Optional:
 - MLflow tracking per target (off by default).
 
 Usage:
-    # 1) Choose which importance models to run (by lowercase keys):
-    #    e.g. only rf + xgb:
-    enabled_models = ["rf", "xgb"]
+    # 1) Choose global task mode:
+    #    - "classification": all y_* treated as classification
+    #    - "regression": all y_* treated as regression (numeric only)
+    TASK_MODE = "classification"
 
-    # 2) Run Stage-1 from the command line:
-    python compute_feature_importances_stage1.py
+    # 2) Choose which importance models to run (by lowercase keys):
+    #    Classification mode example:
+    enabled_models = ["rf", "lgbm", "xgb", "hgb", "cb"]
 
-    # 3) Outputs are written to:
-    #    feature_importances/feature_importances_<y>.csv
+    #    Regression mode example:
+    #    (only rf_reg is meaningful here)
+    enabled_models = ["rf_reg"]
+
+    # 3) Run Stage-1:
+    #    python compute_feature_importances_stage1.py
 """
 
 from __future__ import annotations
@@ -88,6 +106,11 @@ except Exception:  # pragma: no cover - MLflow optional
 # CONFIG
 # ---------------------------------------------------------------------------
 
+# Global task mode:
+#   "classification" → all targets treated as classification
+#   "regression"     → all targets treated as regression (numeric only)
+TASK_MODE = "classification"  # or "regression"
+
 data_path = "input_data.csv"
 feature_importance_dir = Path("feature_importances")
 log_dir = Path("logs")
@@ -108,7 +131,7 @@ missing_thresh = 0.8
 
 # Target skipping
 min_samples_per_target = 200
-min_class_count_for_importance = 2
+min_class_count_for_importance = 2  # only used in classification mode
 
 cpu_count = os.cpu_count() or 4
 n_jobs_targets = max(min(cpu_count - 1, 16), 2)
@@ -118,6 +141,9 @@ cat_fill_value = "NA_CAT"
 
 # Which importance models to run in Stage-1
 # Valid entries: "rf", "rf_reg", "lgbm", "xgb", "hgb", "cb"
+# NOTE:
+#   - classification mode: "rf", "lgbm", "xgb", "hgb", "cb" are used
+#   - regression mode: only "rf_reg" is used (others ignored)
 enabled_models: List[str] = ["rf", "lgbm", "xgb", "hgb", "cb", "rf_reg"]
 
 # Mapping from internal keys to column names (keeps Stage-2 compatible)
@@ -252,11 +278,11 @@ def per_target_missing_cleanup(
     return features
 
 
-def encode_target_for_importance(
+def encode_target_classification(
     y_raw: pd.Series,
     logger: logging.Logger,
 ) -> Tuple[Optional[pd.Series], int, int]:
-    """Encode target to integers and decide if it is usable."""
+    """Encode classification target to integers and decide if it is usable."""
     y_str = y_raw.astype(str)
     counts = y_str.value_counts()
     n_classes = counts.shape[0]
@@ -297,8 +323,8 @@ def prepare_feature_views(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Prepare numeric and CatBoost feature views for one target.
 
-    Uses the true target y for CatBoostEncoder so encoded categoricals
-    carry real signal instead of collapsing to constants.
+    Uses the true target y (classification labels or regression values)
+    for CatBoostEncoder so encoded categoricals carry real signal.
     """
     # Numeric view (for rf/lgbm/xgb/hgb/rf_reg)
     numeric = features.copy()
@@ -312,7 +338,7 @@ def prepare_feature_views(
 
     numeric = numeric.apply(pd.to_numeric, errors="coerce")
 
-    # CatBoost view (for cb)
+    # CatBoost view (for cb in classification mode only)
     cb_view = features.copy()
     cb_cat_cols = cb_view.select_dtypes(include=["object"]).columns.tolist()
     for col in cb_cat_cols:
@@ -321,10 +347,21 @@ def prepare_feature_views(
     return numeric, cb_view
 
 
-def build_importance_models(is_binary: bool) -> Dict[str, object]:
+def build_importance_models(task_mode: str, is_binary: bool) -> Dict[str, object]:
     """Build NaN-aware models used for Stage-1 importances."""
     models: Dict[str, object] = {}
 
+    if task_mode == "regression":
+        # Only rf_reg makes sense here (true numeric y)
+        if "rf_reg" in enabled_models:
+            models["rf_reg"] = RandomForestRegressor(
+                n_estimators=200,
+                random_state=random_state,
+                n_jobs=-1,
+            )
+        return models
+
+    # Classification branch
     if is_binary:
         lgbm_obj = "binary"
         xgb_obj = "binary:logistic"
@@ -336,13 +373,6 @@ def build_importance_models(is_binary: bool) -> Dict[str, object]:
 
     if "rf" in enabled_models:
         models["rf"] = RandomForestClassifier(
-            n_estimators=200,
-            random_state=random_state,
-            n_jobs=-1,
-        )
-
-    if "rf_reg" in enabled_models:
-        models["rf_reg"] = RandomForestRegressor(
             n_estimators=200,
             random_state=random_state,
             n_jobs=-1,
@@ -425,17 +455,41 @@ def compute_importances_for_target(
     numeric: pd.DataFrame,
     cb_view: pd.DataFrame,
     y: pd.Series,
+    task_mode: str,
     logger: logging.Logger,
 ) -> pd.DataFrame:
     """Train enabled models and compute feature importances for one target."""
-    is_binary = y.nunique() == 2
     feature_names = numeric.columns.tolist()
-    models = build_importance_models(is_binary=is_binary)
 
+    if task_mode == "regression":
+        models = build_importance_models(task_mode="regression", is_binary=False)
+        importance_dict: Dict[str, pd.Series] = {}
+
+        for name, proto in models.items():
+            logger.info("Training regression model %s for feature importances.", name)
+            col_name = model_col_names[name]
+            model = proto.__class__(**proto.get_params())
+            model.fit(numeric, y)
+            series_rf_reg = pd.Series(model.feature_importances_, index=feature_names)
+            importance_dict[col_name] = series_rf_reg
+
+        df_imp = pd.DataFrame({"feature_name": feature_names})
+        for col_name, series in importance_dict.items():
+            df_imp[col_name] = series.values
+
+        rank_cols = [c for c in df_imp.columns if c != "feature_name"]
+        ranks = df_imp[rank_cols].rank(method="average", ascending=False)
+        df_imp["mean_rank"] = ranks.mean(axis=1)
+        df_sorted = df_imp.sort_values("mean_rank", ascending=True)
+        return df_sorted
+
+    # Classification branch
+    is_binary = y.nunique() == 2
+    models = build_importance_models(task_mode="classification", is_binary=is_binary)
     importance_dict: Dict[str, pd.Series] = {}
 
     for name, proto in models.items():
-        logger.info("Training model %s for feature importances.", name)
+        logger.info("Training classification model %s for feature importances.", name)
         col_name = model_col_names[name]
 
         if name == "cb":
@@ -459,7 +513,7 @@ def compute_importances_for_target(
             model.fit(numeric, y)
             series_lgbm = pd.Series(model.feature_importances_, index=feature_names)
             importance_dict[col_name] = series_lgbm
-        elif name in {"rf", "rf_reg"}:
+        elif name == "rf":
             model = proto.__class__(**proto.get_params())
             model.fit(numeric, y)
             series_rf = pd.Series(model.feature_importances_, index=feature_names)
@@ -524,16 +578,72 @@ def process_target(
         }
 
     y_raw = df_target[y_col]
-    y_enc, n_classes, min_class = encode_target_for_importance(y_raw, logger)
-    if y_enc is None:
-        return {
-            "target": y_col,
-            "skipped": True,
-            "reason": "rare_or_single_class",
-            "n_rows": int(n_rows),
-            "n_classes": int(n_classes),
-            "min_class_count": int(min_class),
-        }
+
+    if TASK_MODE == "regression":
+        if not pd.api.types.is_numeric_dtype(y_raw):
+            logger.warning(
+                "Skipping %s: non-numeric target in regression mode.",
+                y_col,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "non_numeric_target_regression",
+                "n_rows": int(n_rows),
+            }
+        y_reg = pd.to_numeric(y_raw, errors="coerce")
+        if y_reg.isna().all():
+            logger.warning(
+                "Skipping %s: target becomes all-NaN after numeric coercion.",
+                y_col,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "all_nan_after_coerce",
+                "n_rows": int(n_rows),
+            }
+        y_valid_mask = y_reg.notna()
+        df_target = df_target[y_valid_mask]
+        y_reg = y_reg[y_valid_mask]
+        n_rows = df_target.shape[0]
+        logger.info(
+            "Regression target %s: %d valid numeric rows after coercion.",
+            y_col,
+            n_rows,
+        )
+        if n_rows < min_samples_per_target:
+            logger.warning(
+                "Skipping %s: only %d valid rows (< %d) after coercion.",
+                y_col,
+                n_rows,
+                min_samples_per_target,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "too_few_rows_after_coerce",
+                "n_rows": int(n_rows),
+            }
+        y_for_encoding = y_reg
+        n_classes = 0
+        min_class = 0
+    else:
+        # classification mode
+        y_class, n_classes, min_class = encode_target_classification(
+            y_raw,
+            logger,
+        )
+        if y_class is None:
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "rare_or_single_class",
+                "n_rows": int(n_rows),
+                "n_classes": int(n_classes),
+                "min_class_count": int(min_class),
+            }
+        y_for_encoding = y_class
 
     features_t = base_features.loc[df_target.index].copy()
     logger.info(
@@ -550,7 +660,7 @@ def process_target(
             "n_rows": int(n_rows),
         }
 
-    numeric, cb_view = prepare_feature_views(features_t, y_enc)
+    numeric, cb_view = prepare_feature_views(features_t, y_for_encoding)
     if numeric.shape[1] == 0:
         logger.warning("Skipping %s: no numeric features after encoding.", y_col)
         return {
@@ -564,14 +674,22 @@ def process_target(
     if use_mlflow and mlflow_available and mlflow is not None:
         run = mlflow.start_run(run_name=f"stage1_{y_col}", nested=False)
         mlflow.log_param("target", y_col)
+        mlflow.log_param("task_mode", TASK_MODE)
         mlflow.log_param("n_rows", int(n_rows))
         mlflow.log_param("n_features_after_global", int(base_features.shape[1]))
         mlflow.log_param("n_features_after_missing", int(features_t.shape[1]))
-        mlflow.log_param("n_classes", int(n_classes))
-        mlflow.log_param("min_class_count", int(min_class))
+        if TASK_MODE == "classification":
+            mlflow.log_param("n_classes", int(n_classes))
+            mlflow.log_param("min_class_count", int(min_class))
         mlflow.log_param("enabled_models", ",".join(enabled_models))
 
-    df_sorted = compute_importances_for_target(numeric, cb_view, y_enc, logger)
+    df_sorted = compute_importances_for_target(
+        numeric=numeric,
+        cb_view=cb_view,
+        y=y_for_encoding,
+        task_mode=TASK_MODE,
+        logger=logger,
+    )
 
     out_path = feature_importance_dir / f"feature_importances_{y_col}.csv"
     df_sorted.to_csv(out_path, index=False)
@@ -587,8 +705,7 @@ def process_target(
         "skipped": False,
         "reason": "",
         "n_rows": int(n_rows),
-        "n_classes": int(n_classes),
-        "min_class_count": int(min_class),
+        "task_mode": TASK_MODE,
     }
 
 
@@ -620,9 +737,10 @@ def main() -> None:
         mlflow.set_experiment(mlflow_experiment_name)
 
     log.info(
-        "Starting Stage-1 over %d targets with n_jobs_targets=%d.",
+        "Starting Stage-1 over %d targets with n_jobs_targets=%d (task_mode=%s).",
         len(y_cols),
         n_jobs_targets,
+        TASK_MODE,
     )
 
     results = Parallel(n_jobs=n_jobs_targets)(
