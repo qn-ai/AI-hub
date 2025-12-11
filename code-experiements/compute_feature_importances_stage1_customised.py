@@ -13,30 +13,43 @@ This script:
   per-target (missing thresholds).
 - Builds two feature views per target:
     * Numeric view:
-        - CatBoostEncoder → numeric + NaN (RF/LGBM/XGB/HGB/RF_REG).
+        - CatBoostEncoder → numeric + NaN (rf/lgbm/xgb/hgb/rf_reg).
     * CatBoost raw view:
         - string categoricals + NaN → "NA_CAT" (for CatBoost).
-- Trains NaN-aware models (configurable):
-    * RandomForestClassifier        ("RF")
-    * RandomForestRegressor         ("RF_REG")
-    * LGBMClassifier                ("LGBM")
-    * XGBClassifier                 ("XGB")
-    * HistGradientBoostingClassifier ("HGB")
-    * CatBoostClassifier            ("CB")
+- Trains NaN-aware models (configurable), identified by lowercase keys:
+    * "rf"      → RandomForestClassifier
+    * "rf_reg"  → RandomForestRegressor
+    * "lgbm"    → LGBMClassifier
+    * "xgb"     → XGBClassifier
+    * "hgb"     → HistGradientBoostingClassifier
+    * "cb"      → CatBoostClassifier
 - Extracts feature importances per model:
-    * RF / RF_REG: feature_importances_
-    * LGBM: feature_importances_
-    * XGB: booster.get_score mapped to feature names
-    * HGB: sklearn.inspection.permutation_importance
-    * CatBoost: model.get_feature_importance()
+    * rf / rf_reg: feature_importances_
+    * lgbm: feature_importances_
+    * xgb: booster.get_score mapped to feature names
+    * hgb: sklearn.inspection.permutation_importance
+    * cb: model.get_feature_importance()
 - Saves:
     feature_importances/feature_importances_<y>.csv with columns:
         feature_name, <one column per enabled model>, mean_rank
+      where column names are upper-case aliases:
+        RF, RF_REG, LGBM, XGB, HGB, CB (only for enabled models).
 - Skipped targets saved to:
     feature_importances/skipped_targets_stage1.csv
 
 Optional:
 - MLflow tracking per target (off by default).
+
+Usage:
+    # 1) Set which importance models you want to use:
+    #    e.g. only rf + xgb:
+    ENABLED_MODELS = ["rf", "xgb"]
+
+    # 2) Run Stage-1 from the command line:
+    python compute_feature_importances_stage1.py
+
+    # 3) Outputs are written to:
+    #    feature_importances/feature_importances_<y>.csv
 """
 
 from __future__ import annotations
@@ -104,12 +117,22 @@ USE_CATBOOST_ENCODER = True
 CAT_FILL_VALUE = "NA_CAT"
 
 # Which importance models to run in Stage-1
-# Valid entries: "RF", "RF_REG", "LGBM", "XGB", "HGB", "CB"
-ENABLED_MODELS: List[str] = ["RF", "LGBM", "XGB", "HGB", "CB", "RF_REG"]
+# Valid entries: "rf", "rf_reg", "lgbm", "xgb", "hgb", "cb"
+ENABLED_MODELS: List[str] = ["rf", "lgbm", "xgb", "hgb", "cb", "rf_reg"]
+
+# Mapping from internal keys to column names (keeps Stage-2 compatible)
+MODEL_COL_NAMES: Dict[str, str] = {
+    "rf": "RF",
+    "rf_reg": "RF_REG",
+    "lgbm": "LGBM",
+    "xgb": "XGB",
+    "hgb": "HGB",
+    "cb": "CB",
+}
 
 # MLflow toggle
 USE_MLFLOW = False
-MLFLOW_EXPERIMENT_NAME = "Stage1_FeatureImportances"
+MLFLOW_EXPERIMENT_NAME = "stage1_feature_importances"
 
 FEATURE_IMPORTANCE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,7 +147,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-LOG = logging.getLogger("stage1")
+log = logging.getLogger("stage1")
 
 
 def get_target_logger(y_col: str) -> logging.Logger:
@@ -133,8 +156,9 @@ def get_target_logger(y_col: str) -> logging.Logger:
     logger.setLevel(logging.INFO)
 
     exists = any(
-        isinstance(h, logging.FileHandler) and getattr(h, "_stage1_file", False)
-        for h in logger.handlers
+        isinstance(handler, logging.FileHandler)
+        and getattr(handler, "_stage1_file", False)
+        for handler in logger.handlers
     )
     if not exists:
         file_handler = logging.FileHandler(
@@ -165,21 +189,24 @@ def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
 
 
 def global_feature_cleanup(
-    X: pd.DataFrame,
+    features: pd.DataFrame,
     logger: logging.Logger,
 ) -> pd.DataFrame:
     """Perform global variance + correlation cleanup on numeric ft_ columns."""
     if not USE_GLOBAL_CLEANUP:
-        logger.info("Global cleanup disabled; keeping all %d features.", X.shape[1])
-        return X
+        logger.info(
+            "Global cleanup disabled; keeping all %d features.",
+            features.shape[1],
+        )
+        return features
 
-    logger.info("Global cleanup: initial feature count = %d", X.shape[1])
-    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+    logger.info("Global cleanup: initial feature count = %d", features.shape[1])
+    numeric_cols = features.select_dtypes(include=[np.number]).columns.tolist()
 
     # Zero-variance removal
     if numeric_cols:
         vt = VarianceThreshold(threshold=VAR_THRESH)
-        vt.fit(X[numeric_cols])
+        vt.fit(features[numeric_cols])
         keep_mask = vt.get_support()
         keep_cols = [c for c, keep in zip(numeric_cols, keep_mask) if keep]
         drop_cols = [c for c in numeric_cols if c not in keep_cols]
@@ -188,12 +215,12 @@ def global_feature_cleanup(
                 "Dropping %d zero-variance numeric features.",
                 len(drop_cols),
             )
-            X = X.drop(columns=drop_cols)
+            features = features.drop(columns=drop_cols)
             numeric_cols = keep_cols
 
     # High correlation removal
     if len(numeric_cols) > 1:
-        corr = X[numeric_cols].corr().abs()
+        corr = features[numeric_cols].corr().abs()
         upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
         to_drop = [c for c in upper.columns if any(upper[c] > CORR_THRESH)]
         if to_drop:
@@ -202,18 +229,18 @@ def global_feature_cleanup(
                 len(to_drop),
                 CORR_THRESH,
             )
-            X = X.drop(columns=to_drop)
+            features = features.drop(columns=to_drop)
 
-    logger.info("Global cleanup: final feature count = %d", X.shape[1])
-    return X
+    logger.info("Global cleanup: final feature count = %d", features.shape[1])
+    return features
 
 
 def per_target_missing_cleanup(
-    X: pd.DataFrame,
+    features: pd.DataFrame,
     logger: logging.Logger,
 ) -> pd.DataFrame:
     """Drop features with too many NaNs for this target subset."""
-    missing_ratio = X.isna().mean()
+    missing_ratio = features.isna().mean()
     drop_cols = missing_ratio[missing_ratio > MISSING_THRESH].index.tolist()
     if drop_cols:
         logger.info(
@@ -221,20 +248,15 @@ def per_target_missing_cleanup(
             len(drop_cols),
             MISSING_THRESH,
         )
-        X = X.drop(columns=drop_cols)
-    return X
+        features = features.drop(columns=drop_cols)
+    return features
 
 
 def encode_target_for_importance(
     y_raw: pd.Series,
     logger: logging.Logger,
 ) -> Tuple[Optional[pd.Series], int, int]:
-    """Encode target to integers and decide if it is usable.
-
-    Returns:
-        Tuple (y_encoded, n_classes, min_class_count).
-        If y_encoded is None, the target should be skipped.
-    """
+    """Encode target to integers and decide if it is usable."""
     y_str = y_raw.astype(str)
     counts = y_str.value_counts()
     n_classes = counts.shape[0]
@@ -270,40 +292,33 @@ def encode_target_for_importance(
 
 
 def prepare_feature_views(
-    X: pd.DataFrame,
+    features: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Prepare numeric and CatBoost feature views.
-
-    Returns:
-        Tuple (X_num, X_cb).
-    """
+    """Prepare numeric and CatBoost feature views."""
     # Numeric view
-    X_num = X.copy()
-    cat_cols = X_num.select_dtypes(include=["object"]).columns.tolist()
+    numeric = features.copy()
+    cat_cols = numeric.select_dtypes(include=["object"]).columns.tolist()
 
     if USE_CATBOOST_ENCODER and cat_cols:
         encoder = CatBoostEncoder(cols=cat_cols, random_state=RANDOM_STATE)
-        dummy_y = np.zeros(len(X_num))
-        X_num = encoder.fit_transform(X_num, dummy_y)
+        dummy_y = np.zeros(len(numeric))
+        numeric = encoder.fit_transform(numeric, dummy_y)
     elif cat_cols:
-        X_num = X_num.drop(columns=cat_cols)
+        numeric = numeric.drop(columns=cat_cols)
 
-    X_num = X_num.apply(pd.to_numeric, errors="coerce")
+    numeric = numeric.apply(pd.to_numeric, errors="coerce")
 
     # CatBoost view
-    X_cb = X.copy()
-    cb_cat_cols = X_cb.select_dtypes(include=["object"]).columns.tolist()
+    cb_view = features.copy()
+    cb_cat_cols = cb_view.select_dtypes(include=["object"]).columns.tolist()
     for col in cb_cat_cols:
-        X_cb[col] = X_cb[col].astype("string").fillna(CAT_FILL_VALUE)
+        cb_view[col] = cb_view[col].astype("string").fillna(CAT_FILL_VALUE)
 
-    return X_num, X_cb
+    return numeric, cb_view
 
 
 def build_importance_models(is_binary: bool) -> Dict[str, object]:
-    """Build lighter, NaN-aware models used for Stage-1 importances.
-
-    Which models are actually instantiated is controlled by ENABLED_MODELS.
-    """
+    """Build lighter, NaN-aware models used for Stage-1 importances."""
     models: Dict[str, object] = {}
 
     if is_binary:
@@ -315,22 +330,22 @@ def build_importance_models(is_binary: bool) -> Dict[str, object]:
         xgb_obj = "multi:softprob"
         cb_loss = "MultiClass"
 
-    if "RF" in ENABLED_MODELS:
-        models["RF"] = RandomForestClassifier(
+    if "rf" in ENABLED_MODELS:
+        models["rf"] = RandomForestClassifier(
             n_estimators=200,
             random_state=RANDOM_STATE,
             n_jobs=-1,
         )
 
-    if "RF_REG" in ENABLED_MODELS:
-        models["RF_REG"] = RandomForestRegressor(
+    if "rf_reg" in ENABLED_MODELS:
+        models["rf_reg"] = RandomForestRegressor(
             n_estimators=200,
             random_state=RANDOM_STATE,
             n_jobs=-1,
         )
 
-    if "LGBM" in ENABLED_MODELS:
-        models["LGBM"] = LGBMClassifier(
+    if "lgbm" in ENABLED_MODELS:
+        models["lgbm"] = LGBMClassifier(
             n_estimators=150,
             learning_rate=0.1,
             objective=lgbm_obj,
@@ -346,8 +361,8 @@ def build_importance_models(is_binary: bool) -> Dict[str, object]:
             verbosity=-1,
         )
 
-    if "XGB" in ENABLED_MODELS:
-        models["XGB"] = XGBClassifier(
+    if "xgb" in ENABLED_MODELS:
+        models["xgb"] = XGBClassifier(
             n_estimators=200,
             learning_rate=0.1,
             max_depth=6,
@@ -360,14 +375,14 @@ def build_importance_models(is_binary: bool) -> Dict[str, object]:
             n_jobs=-1,
         )
 
-    if "HGB" in ENABLED_MODELS:
-        models["HGB"] = HistGradientBoostingClassifier(
+    if "hgb" in ENABLED_MODELS:
+        models["hgb"] = HistGradientBoostingClassifier(
             max_depth=None,
             random_state=RANDOM_STATE,
         )
 
-    if "CB" in ENABLED_MODELS:
-        models["CB"] = CatBoostClassifier(
+    if "cb" in ENABLED_MODELS:
+        models["cb"] = CatBoostClassifier(
             iterations=200,
             depth=6,
             learning_rate=0.1,
@@ -403,73 +418,70 @@ def get_xgb_importance(
 
 
 def compute_importances_for_target(
-    X_num: pd.DataFrame,
-    X_cb: pd.DataFrame,
+    numeric: pd.DataFrame,
+    cb_view: pd.DataFrame,
     y: pd.Series,
     logger: logging.Logger,
 ) -> pd.DataFrame:
     """Train enabled models and compute feature importances for one target."""
     is_binary = y.nunique() == 2
-    feature_names = X_num.columns.tolist()
+    feature_names = numeric.columns.tolist()
     models = build_importance_models(is_binary=is_binary)
 
     importance_dict: Dict[str, pd.Series] = {}
 
     for name, proto in models.items():
         logger.info("Training model %s for feature importances.", name)
-        if name == "CB":
-            cb_cat_cols = X_cb.select_dtypes(include=["string"]).columns.tolist()
-            cat_indices = [X_cb.columns.get_loc(c) for c in cb_cat_cols]
+        col_name = MODEL_COL_NAMES[name]
+
+        if name == "cb":
+            cb_cat_cols = cb_view.select_dtypes(include=["string"]).columns.tolist()
+            cat_indices = [cb_view.columns.get_loc(col) for col in cb_cat_cols]
             model = proto.__class__(**proto.get_params())
             model.fit(
-                X_cb,
+                cb_view,
                 y,
                 cat_features=cat_indices if cat_indices else None,
             )
-            cb_raw = model.get_feature_importance()
-            series = (
-                pd.Series(cb_raw, index=X_cb.columns)
+            raw_cb = model.get_feature_importance()
+            series_cb = (
+                pd.Series(raw_cb, index=cb_view.columns)
                 .reindex(feature_names)
                 .fillna(0.0)
             )
-            importance_dict["CB"] = series
-        elif name == "LGBM":
+            importance_dict[col_name] = series_cb
+        elif name == "lgbm":
             model = proto.__class__(**proto.get_params())
-            model.fit(X_num, y)
-            series = pd.Series(model.feature_importances_, index=feature_names)
-            importance_dict["LGBM"] = series
-        elif name == "RF":
+            model.fit(numeric, y)
+            series_lgbm = pd.Series(model.feature_importances_, index=feature_names)
+            importance_dict[col_name] = series_lgbm
+        elif name in {"rf", "rf_reg"}:
             model = proto.__class__(**proto.get_params())
-            model.fit(X_num, y)
-            series = pd.Series(model.feature_importances_, index=feature_names)
-            importance_dict["RF"] = series
-        elif name == "RF_REG":
+            model.fit(numeric, y)
+            series_rf = pd.Series(model.feature_importances_, index=feature_names)
+            importance_dict[col_name] = series_rf
+        elif name == "xgb":
             model = proto.__class__(**proto.get_params())
-            model.fit(X_num, y)
-            series = pd.Series(model.feature_importances_, index=feature_names)
-            importance_dict["RF_REG"] = series
-        elif name == "XGB":
+            model.fit(numeric, y)
+            series_xgb = get_xgb_importance(model, feature_names)
+            importance_dict[col_name] = series_xgb.reindex(feature_names).fillna(0.0)
+        elif name == "hgb":
             model = proto.__class__(**proto.get_params())
-            model.fit(X_num, y)
-            series = get_xgb_importance(model, feature_names)
-            importance_dict["XGB"] = series.reindex(feature_names).fillna(0.0)
-        elif name == "HGB":
-            model = proto.__class__(**proto.get_params())
-            model.fit(X_num, y)
+            model.fit(numeric, y)
             perm = permutation_importance(
                 model,
-                X_num,
+                numeric,
                 y,
                 n_repeats=3,
                 random_state=RANDOM_STATE,
                 n_jobs=-1,
             )
-            series = pd.Series(perm.importances_mean, index=feature_names)
-            importance_dict["HGB"] = series
+            series_hgb = pd.Series(perm.importances_mean, index=feature_names)
+            importance_dict[col_name] = series_hgb
 
     df_imp = pd.DataFrame({"feature_name": feature_names})
-    for name, series in importance_dict.items():
-        df_imp[name] = series.values
+    for col_name, series in importance_dict.items():
+        df_imp[col_name] = series.values
 
     rank_cols = [c for c in df_imp.columns if c != "feature_name"]
     ranks = df_imp[rank_cols].rank(method="average", ascending=False)
@@ -485,14 +497,14 @@ def compute_importances_for_target(
 def process_target(
     y_col: str,
     df: pd.DataFrame,
-    X_base: pd.DataFrame,
+    base_features: pd.DataFrame,
 ) -> Dict[str, object]:
     """Process a single target column for Stage-1."""
     logger = get_target_logger(y_col)
     logger.info("=== Stage-1 feature importances for %s ===", y_col)
 
-    df_t = df[df[y_col].notna()].copy()
-    n_rows = df_t.shape[0]
+    df_target = df[df[y_col].notna()].copy()
+    n_rows = df_target.shape[0]
     if n_rows < MIN_SAMPLES_PER_TARGET:
         logger.warning(
             "Skipping %s: only %d labelled rows (< %d).",
@@ -507,7 +519,7 @@ def process_target(
             "n_rows": int(n_rows),
         }
 
-    y_raw = df_t[y_col]
+    y_raw = df_target[y_col]
     y_enc, n_classes, min_class = encode_target_for_importance(y_raw, logger)
     if y_enc is None:
         return {
@@ -519,10 +531,13 @@ def process_target(
             "min_class_count": int(min_class),
         }
 
-    X_t = X_base.loc[df_t.index].copy()
-    logger.info("Features before per-target missing cleanup: %d", X_t.shape[1])
-    X_t = per_target_missing_cleanup(X_t, logger)
-    if X_t.shape[1] == 0:
+    features_t = base_features.loc[df_target.index].copy()
+    logger.info(
+        "Features before per-target missing cleanup: %d",
+        features_t.shape[1],
+    )
+    features_t = per_target_missing_cleanup(features_t, logger)
+    if features_t.shape[1] == 0:
         logger.warning("Skipping %s: all features dropped by missing filter.", y_col)
         return {
             "target": y_col,
@@ -531,8 +546,8 @@ def process_target(
             "n_rows": int(n_rows),
         }
 
-    X_num, X_cb = prepare_feature_views(X_t)
-    if X_num.shape[1] == 0:
+    numeric, cb_view = prepare_feature_views(features_t)
+    if numeric.shape[1] == 0:
         logger.warning("Skipping %s: no numeric features after encoding.", y_col)
         return {
             "target": y_col,
@@ -546,13 +561,13 @@ def process_target(
         run = mlflow.start_run(run_name=f"stage1_{y_col}", nested=False)
         mlflow.log_param("target", y_col)
         mlflow.log_param("n_rows", int(n_rows))
-        mlflow.log_param("n_features_after_global", int(X_base.shape[1]))
-        mlflow.log_param("n_features_after_missing", int(X_t.shape[1]))
+        mlflow.log_param("n_features_after_global", int(base_features.shape[1]))
+        mlflow.log_param("n_features_after_missing", int(features_t.shape[1]))
         mlflow.log_param("n_classes", int(n_classes))
         mlflow.log_param("min_class_count", int(min_class))
         mlflow.log_param("enabled_models", ",".join(ENABLED_MODELS))
 
-    df_sorted = compute_importances_for_target(X_num, X_cb, y_enc, logger)
+    df_sorted = compute_importances_for_target(numeric, cb_view, y_enc, logger)
 
     out_path = FEATURE_IMPORTANCE_DIR / f"feature_importances_{y_col}.csv"
     df_sorted.to_csv(out_path, index=False)
@@ -579,11 +594,11 @@ def process_target(
 
 def main() -> None:
     """Run Stage-1 feature importance computation over all y_* targets."""
-    LOG.info("Loading data from %s", DATA_PATH)
+    log.info("Loading data from %s", DATA_PATH)
     df = pd.read_csv(DATA_PATH, low_memory=False)
 
     id_cols, ft_cols, y_cols = detect_columns(df)
-    LOG.info(
+    log.info(
         "Detected %d id_, %d ft_, %d y_ columns.",
         len(id_cols),
         len(ft_cols),
@@ -591,35 +606,37 @@ def main() -> None:
     )
 
     if not ft_cols or not y_cols:
-        LOG.error("No ft_ or y_ columns detected; aborting.")
+        log.error("No ft_ or y_ columns detected; aborting.")
         return
 
-    X_all = df[ft_cols].copy()
-    X_base = global_feature_cleanup(X_all, LOG)
+    all_features = df[ft_cols].copy()
+    base_features = global_feature_cleanup(all_features, log)
 
     if USE_MLFLOW and MLFLOW_AVAILABLE and mlflow is not None:
         mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
-    LOG.info(
+    log.info(
         "Starting Stage-1 over %d targets with N_JOBS_TARGETS=%d.",
         len(y_cols),
         N_JOBS_TARGETS,
     )
 
     results = Parallel(n_jobs=N_JOBS_TARGETS)(
-        delayed(process_target)(y_col, df, X_base) for y_col in y_cols
+        delayed(process_target)(y_col, df, base_features) for y_col in y_cols
     )
 
-    skipped_records = [r for r in results if r.get("skipped")]
+    skipped_records = [record for record in results if record.get("skipped")]
     if skipped_records:
         df_skipped = pd.DataFrame(skipped_records)
         df_skipped.to_csv(SKIPPED_TARGETS_CSV, index=False)
-        LOG.info("Saved skipped targets summary to %s", SKIPPED_TARGETS_CSV)
+        log.info("Saved skipped targets summary to %s", SKIPPED_TARGETS_CSV)
     else:
-        LOG.info("No targets skipped in Stage-1.")
+        log.info("No targets skipped in Stage-1.")
 
-    processed_count = sum(1 for r in results if not r.get("skipped"))
-    LOG.info(
+    processed_count = sum(
+        1 for record in results if not record.get("skipped")
+    )
+    log.info(
         "Stage-1 completed: %d processed, %d skipped.",
         processed_count,
         len(skipped_records),
