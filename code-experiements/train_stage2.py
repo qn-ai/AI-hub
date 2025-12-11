@@ -1,39 +1,78 @@
 #!/usr/bin/env python3
 """
 Stage-2: Per-target model training with dynamic CV folds and
-saving one trained model per algorithm (RF, LGBM, XGB, HGB, CB).
+consistent classification/regression logic mirroring Stage-1.
 
-This stage:
+This script:
 
 - Uses feature_importances_<y>.csv from Stage-1 to choose features per target.
-- For each y_*:
-    * Filters non-missing rows.
-    * Checks class distribution and chooses n_splits = min(MAX_N_SPLITS,
-      min_class_count).
-    * Skips targets with too few rows or degenerate classes.
-    * Builds two feature views:
-        - Numeric (CatBoostEncoder) for RF / LGBM / XGB / HGB.
-        - Raw string categorical view for CatBoost.
-    * Cross-validates all 5 models and computes metrics:
-        - F1, Precision, Recall, Accuracy, AUC.
-    * Selects the best model by F1.
-    * Refits ALL 5 models on the full target data.
-    * Saves:
-        - trained_models/y_<target>_RF.joblib
-        - trained_models/y_<target>_LGBM.joblib
-        - trained_models/y_<target>_XGB.joblib
-        - trained_models/y_<target>_HGB.joblib
-        - trained_models/y_<target>_CB.joblib
-        - trained_models/y_<target>_best.joblib (alias to best model).
+- Supports two global modes (matching Stage-1):
+
+    TASK_MODE = "classification"
+        * All y_* treated as classification targets.
+        * For each y_*:
+            - Filters non-missing rows.
+            - Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
+            - Skips targets with only one class or smallest class too small.
+            - Loads feature_importances_<y>.csv and selects features where:
+                RF > 0 & LGBM > 0 & CB > 0 & XGB > 0 & HGB > 0.
+            - Builds two feature views:
+                - Numeric (CatBoostEncoder) for RF / LGBM / XGB / HGB.
+                - Raw string categorical view for CatBoost.
+            - Chooses dynamic n_splits as:
+                n_splits = min(MAX_N_SPLITS_CLASSIFICATION, min_class_count)
+                (must be >= 2).
+            - Cross-validates all 5 models and computes metrics:
+                F1 (macro), Precision (macro), Recall (macro),
+                Accuracy, AUC (binary or multiclass).
+            - Selects best model by F1.
+            - Refits ALL 5 models on full data.
+            - Saves:
+                trained_models/y_<target>_RF.joblib
+                trained_models/y_<target>_LGBM.joblib
+                trained_models/y_<target>_XGB.joblib
+                trained_models/y_<target>_HGB.joblib
+                trained_models/y_<target>_CB.joblib
+                trained_models/y_<target>_best.joblib
+
+    TASK_MODE = "regression"
+        * All y_* treated as regression candidates.
+        * For each y_*:
+            - Filters non-missing rows.
+            - Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
+            - Skips non-numeric targets.
+            - Skips numeric targets with too few unique values
+              (<= REGRESSION_MIN_UNIQUE).
+            - Loads feature_importances_<y>.csv and selects features where:
+                RF_REG > 0.
+            - Builds numeric CatBoostEncoder view.
+            - Uses KFold with dynamic n_splits:
+                n_splits = min(MAX_N_SPLITS_REGRESSION, n_samples)
+                (must be >= 2).
+            - Cross-validates one or more regression models (configurable):
+                * RF_REG   → RandomForestRegressor
+                * LGBM_REG → LGBMRegressor
+                * XGB_REG  → XGBRegressor
+                * HGB_REG  → HistGradientBoostingRegressor
+                * CB_REG   → CatBoostRegressor
+            - Computes metrics:
+                RMSE, MAE, R2.
+            - Selects best model by lowest RMSE.
+            - Refits all selected regression models on full data.
+            - Saves:
+                trained_models/y_<target>_<MODEL>.joblib for each enabled model
+                trained_models/y_<target>_best.joblib (best model alias)
 
 Outputs:
 
 - model_cv_results_parallel.csv
 - model_cv_results_parallel.json
 - skipped_targets_stage2.csv
-- logs/y_<target>_stage2.log
+- logs/y_<target>_stage2.log (per-target logging)
 
-MLflow is optional and disabled by default.
+Optional:
+
+- MLflow tracking per target (off by default).
 """
 
 from __future__ import annotations
@@ -44,66 +83,90 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 from category_encoders import CatBoostEncoder
-from catboost import CatBoostClassifier
-from joblib import Parallel, delayed
-from lightgbm import LGBMClassifier
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from catboost import CatBoostClassifier, CatBoostRegressor
+from joblib import Parallel, delayed, dump, load
+from lightgbm import LGBMClassifier, LGBMRegressor
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
+    mean_absolute_error,
+    mean_squared_error,
     precision_score,
+    r2_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier
+from sklearn.model_selection import KFold, StratifiedKFold
+from xgboost import XGBClassifier, XGBRegressor
 
 # Optional MLflow
 try:
     import mlflow  # type: ignore[import]
 
-    MLFLOW_AVAILABLE = True
-except Exception:  # pragma: no cover - MLflow optional
+    mlflow_available = True
+except Exception:  # pragma: no cover - optional
     mlflow = None  # type: ignore[assignment]
-    MLFLOW_AVAILABLE = False
+    mlflow_available = False
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 
-DATA_PATH = "input_data.csv"
-FEATURE_IMPORTANCE_DIR = Path("feature_importances")
-TRAINED_MODELS_DIR = Path("trained_models")
-LOG_DIR = Path("logs")
+# Global task mode (mirror Stage-1):
+#   "classification" → all targets treated as classification
+#   "regression"     → all targets treated as regression (numeric only)
+TASK_MODE = "classification"  # or "regression"
 
-RESULTS_CSV = "model_cv_results_parallel.csv"
-RESULTS_JSON = "model_cv_results_parallel.json"
-SKIPPED_CSV = "skipped_targets_stage2.csv"
+data_path = "input_data.csv"
+feature_importance_dir = Path("feature_importances")
+models_dir = Path("trained_models")
+log_dir = Path("logs")
 
-ID_PREFIX = "id_"
-FEATURE_PREFIX = "ft_"
-TARGET_PREFIX = "y_"
+id_prefix = "id_"
+feature_prefix = "ft_"
+target_prefix = "y_"
 
-RANDOM_STATE = 42
-MAX_N_SPLITS = 5
+random_state = 42
 
-CPU_COUNT = os.cpu_count() or 4
-N_JOBS_TARGETS = max(min(CPU_COUNT - 1, 16), 2)
+min_samples_per_target = 200
+min_class_count_for_training = 2  # classification
 
-USE_CATBOOST_ENCODER = True
-CAT_FILL_VALUE = "NA_CAT"
+# Regression unique-values threshold (same as Stage-1)
+REGRESSION_MIN_UNIQUE = 10
 
-# MLflow toggle
-USE_MLFLOW = False
-MLFLOW_EXPERIMENT_NAME = "Stage2_ModelTraining"
+max_n_splits_classification = 5
+max_n_splits_regression = 5
 
-TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+cpu_count = os.cpu_count() or 4
+n_jobs_targets = max(min(cpu_count - 1, 16), 2)
+
+use_catboost_encoder = True
+cat_fill_value = "NA_CAT"
+
+# Regression model choices (you can change this list)
+# Allowed keys: "RF_REG", "LGBM_REG", "XGB_REG", "HGB_REG", "CB_REG"
+REGRESSION_MODELS: List[str] = ["RF_REG"]
+
+# MLflow
+use_mlflow = False
+mlflow_experiment_name = "stage2_model_training"
+
+feature_importance_dir.mkdir(parents=True, exist_ok=True)
+models_dir.mkdir(parents=True, exist_ok=True)
+log_dir.mkdir(parents=True, exist_ok=True)
+
+skipped_targets_csv = models_dir / "skipped_targets_stage2.csv"
+cv_results_csv = models_dir / "model_cv_results_parallel.csv"
+cv_results_json = models_dir / "model_cv_results_parallel.json"
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -113,7 +176,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-LOG = logging.getLogger("stage2")
+log = logging.getLogger("stage2")
 
 
 def get_target_logger(y_col: str) -> logging.Logger:
@@ -122,12 +185,13 @@ def get_target_logger(y_col: str) -> logging.Logger:
     logger.setLevel(logging.INFO)
 
     exists = any(
-        isinstance(h, logging.FileHandler) and getattr(h, "_stage2_file", False)
-        for h in logger.handlers
+        isinstance(handler, logging.FileHandler)
+        and getattr(handler, "_stage2_file", False)
+        for handler in logger.handlers
     )
     if not exists:
         file_handler = logging.FileHandler(
-            LOG_DIR / f"{y_col}_stage2.log",
+            log_dir / f"{y_col}_stage2.log",
             mode="w",
             encoding="utf-8",
         )
@@ -146,153 +210,170 @@ def get_target_logger(y_col: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
-    """Detect id_, ft_, y_ columns by prefix.
-
-    Args:
-        df: Input dataframe.
-
-    Returns:
-        Tuple of lists (id_cols, ft_cols, y_cols).
-    """
-    id_cols = [c for c in df.columns if c.startswith(ID_PREFIX)]
-    ft_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
-    y_cols = [c for c in df.columns if c.startswith(TARGET_PREFIX)]
+    """Detect id_, ft_, y_ columns by prefix."""
+    id_cols = [c for c in df.columns if c.startswith(id_prefix)]
+    ft_cols = [c for c in df.columns if c.startswith(feature_prefix)]
+    y_cols = [c for c in df.columns if c.startswith(target_prefix)]
     return id_cols, ft_cols, y_cols
 
 
-def load_selected_features(y_col: str, logger: logging.Logger) -> List[str]:
-    """Load selected features from feature_importances_<y>.csv.
-
-    Only keep features where RF, LGBM, CB, XGB, HGB > 0.
-
-    Args:
-        y_col: Target column name.
-        logger: Logger for messages.
-
-    Returns:
-        List of feature names to use for this target.
-    """
-    path = FEATURE_IMPORTANCE_DIR / f"feature_importances_{y_col}.csv"
+def load_feature_importances_for_target(
+    y_col: str,
+    task_mode: str,
+    logger: logging.Logger,
+) -> Optional[List[str]]:
+    """Load Stage-1 importance file for y_col and select usable features."""
+    path = feature_importance_dir / f"feature_importances_{y_col}.csv"
     if not path.exists():
-        logger.warning("Feature importance file not found: %s", path)
-        return []
+        logger.warning("No feature_importances file for %s at %s", y_col, path)
+        return None
 
     df_imp = pd.read_csv(path)
     if "feature_name" not in df_imp.columns:
-        # Fallback if first column is feature names.
-        df_imp = df_imp.rename(columns={df_imp.columns[0]: "feature_name"})
+        logger.warning(
+            "feature_importances_%s.csv has no 'feature_name' column; skipping.",
+            y_col,
+        )
+        return None
 
-    required = ["RF", "LGBM", "CB", "XGB", "HGB"]
-    missing = [c for c in required if c not in df_imp.columns]
-    if missing:
-        logger.warning("Importance file %s missing columns %s", path, missing)
-        return []
+    if task_mode == "regression":
+        if "RF_REG" not in df_imp.columns:
+            logger.warning(
+                "feature_importances_%s.csv has no 'RF_REG'; skipping.",
+                y_col,
+            )
+            return None
+        mask = df_imp["RF_REG"] > 0
+    else:
+        required = ["RF", "LGBM", "CB", "XGB", "HGB"]
+        missing = [c for c in required if c not in df_imp.columns]
+        if missing:
+            logger.warning(
+                "feature_importances_%s.csv missing columns %s; skipping.",
+                y_col,
+                missing,
+            )
+            return None
+        mask = (
+            (df_imp["RF"] > 0)
+            & (df_imp["LGBM"] > 0)
+            & (df_imp["CB"] > 0)
+            & (df_imp["XGB"] > 0)
+            & (df_imp["HGB"] > 0)
+        )
 
-    mask = (df_imp[required] > 0).all(axis=1)
-    selected = df_imp.loc[mask, "feature_name"].astype(str).tolist()
-    logger.info("Selected %d features for %s", len(selected), y_col)
+    selected = df_imp.loc[mask, "feature_name"].dropna().unique().tolist()
+    if not selected:
+        logger.warning(
+            "No features selected for %s after importance filter; skipping.",
+            y_col,
+        )
+        return None
+
+    logger.info(
+        "Selected %d features for %s from Stage-1 importances.",
+        len(selected),
+        y_col,
+    )
     return selected
 
 
-def prepare_target_and_cv(
-    y_raw: pd.Series,
-    logger: logging.Logger,
-) -> Tuple[Optional[pd.Series], Optional[LabelEncoder], Optional[int]]:
-    """Encode target labels and decide on number of CV folds.
+def prepare_views_classification(
+    features: pd.DataFrame,
+    y: pd.Series,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Prepare numeric and CatBoost views for classification."""
+    numeric = features.copy()
+    cat_cols = numeric.select_dtypes(include=["object"]).columns.tolist()
 
-    Args:
-        y_raw: Raw target series with non-missing values.
-        logger: Logger for this target.
+    if use_catboost_encoder and cat_cols:
+        encoder = CatBoostEncoder(cols=cat_cols, random_state=random_state)
+        numeric = encoder.fit_transform(numeric, y)
+    elif cat_cols:
+        numeric = numeric.drop(columns=cat_cols)
 
-    Returns:
-        Tuple (y_encoded, label_encoder, n_splits).
-        If y_encoded is None, target should be skipped.
-    """
-    y_str = y_raw.astype(str)
-    counts = y_str.value_counts()
-    n_classes = counts.shape[0]
+    numeric = numeric.apply(pd.to_numeric, errors="coerce")
+
+    cb_view = features.copy()
+    cb_cat_cols = cb_view.select_dtypes(include=["object"]).columns.tolist()
+    for col in cb_cat_cols:
+        cb_view[col] = cb_view[col].astype("string").fillna(cat_fill_value)
+
+    return numeric, cb_view
+
+
+def prepare_view_regression(
+    features: pd.DataFrame,
+    y: pd.Series,
+) -> pd.DataFrame:
+    """Prepare numeric CatBoost-encoded view for regression."""
+    numeric = features.copy()
+    cat_cols = numeric.select_dtypes(include=["object"]).columns.tolist()
+
+    if use_catboost_encoder and cat_cols:
+        encoder = CatBoostEncoder(cols=cat_cols, random_state=random_state)
+        numeric = encoder.fit_transform(numeric, y)
+    elif cat_cols:
+        numeric = numeric.drop(columns=cat_cols)
+
+    numeric = numeric.apply(pd.to_numeric, errors="coerce")
+    return numeric
+
+
+def choose_stratified_cv(y: pd.Series, logger: logging.Logger) -> Optional[StratifiedKFold]:
+    """Choose dynamic StratifiedKFold for classification based on class counts."""
+    counts = y.value_counts()
     min_count = int(counts.min())
-
-    logger.info("Class distribution: %s", counts.to_dict())
-
-    if min_count < 2:
-        logger.warning(
-            "Skipping target: min class count = %d < 2 (n_classes=%d).",
-            min_count,
-            n_classes,
-        )
-        return None, None, None
-
-    n_splits = min(MAX_N_SPLITS, min_count)
-    if n_splits < 2:
-        logger.warning("Skipping target: computed n_splits=%d < 2.", n_splits)
-        return None, None, None
-
-    encoder = LabelEncoder()
-    y_enc = pd.Series(
-        encoder.fit_transform(y_str),
-        index=y_raw.index,
-        dtype="int64",
-    )
+    n_splits = min(max_n_splits_classification, min_count)
 
     logger.info(
-        "Using n_splits=%d (n_classes=%d, min_class_count=%d, labels=%s).",
+        "Class distribution: %s; chosen n_splits=%d",
+        counts.to_dict(),
         n_splits,
-        n_classes,
-        min_count,
-        np.unique(y_enc).tolist(),
     )
-    return y_enc, encoder, n_splits
+
+    if n_splits < 2:
+        logger.warning(
+            "Cannot build StratifiedKFold: min_count=%d < 2; skipping target.",
+            min_count,
+        )
+        return None
+
+    return StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=random_state,
+    )
 
 
-def prepare_catboost_view(X: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """Prepare CatBoost view: string categoricals, NaNs -> CAT_FILL_VALUE.
+def choose_kfold_regression(
+    n_samples: int,
+    logger: logging.Logger,
+) -> Optional[KFold]:
+    """Choose dynamic KFold for regression based on sample size."""
+    n_splits = min(max_n_splits_regression, n_samples)
+    logger.info("Regression KFold: n_samples=%d, n_splits=%d", n_samples, n_splits)
 
-    Args:
-        X: Raw feature dataframe.
+    if n_splits < 2:
+        logger.warning(
+            "Cannot build KFold: n_splits=%d < 2; skipping target.",
+            n_splits,
+        )
+        return None
 
-    Returns:
-        Tuple (X_cb, cat_cols).
-    """
-    X_cb = X.copy()
-    cat_cols = X_cb.select_dtypes(include=["object"]).columns.tolist()
-    for col in cat_cols:
-        X_cb[col] = X_cb[col].astype("string").fillna(CAT_FILL_VALUE)
-    return X_cb, cat_cols
-
-
-def prepare_numeric_view(X: pd.DataFrame) -> pd.DataFrame:
-    """Prepare numeric view with CatBoostEncoder for tree-based models.
-
-    Args:
-        X: Raw feature dataframe.
-
-    Returns:
-        Numeric dataframe with NaNs preserved.
-    """
-    X_num = X.copy()
-    cat_cols = X_num.select_dtypes(include=["object"]).columns.tolist()
-
-    if USE_CATBOOST_ENCODER and cat_cols:
-        encoder = CatBoostEncoder(cols=cat_cols, random_state=RANDOM_STATE)
-        dummy_y = np.zeros(len(X_num))
-        X_num = encoder.fit_transform(X_num, dummy_y)
-    elif cat_cols:
-        X_num = X_num.drop(columns=cat_cols)
-
-    X_num = X_num.apply(pd.to_numeric, errors="coerce")
-    return X_num
+    return KFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=random_state,
+    )
 
 
-def build_models(is_binary: bool) -> Dict[str, object]:
-    """Build model prototypes for this target.
+# ---------------------------------------------------------------------------
+# MODEL BUILDERS
+# ---------------------------------------------------------------------------
 
-    Args:
-        is_binary: True if target has 2 classes.
-
-    Returns:
-        Dictionary mapping model name to model prototype.
-    """
+def build_classification_models(is_binary: bool) -> Dict[str, object]:
+    """Build classification models (RF, LGBM, XGB, HGB, CB)."""
     if is_binary:
         lgbm_obj = "binary"
         xgb_obj = "binary:logistic"
@@ -305,7 +386,7 @@ def build_models(is_binary: bool) -> Dict[str, object]:
     models: Dict[str, object] = {
         "RF": RandomForestClassifier(
             n_estimators=300,
-            random_state=RANDOM_STATE,
+            random_state=random_state,
             n_jobs=-1,
         ),
         "LGBM": LGBMClassifier(
@@ -314,8 +395,9 @@ def build_models(is_binary: bool) -> Dict[str, object]:
             objective=lgbm_obj,
             subsample=0.8,
             colsample_bytree=0.8,
-            random_state=RANDOM_STATE,
+            random_state=random_state,
             n_jobs=-1,
+            verbosity=-1,
         ),
         "XGB": XGBClassifier(
             n_estimators=300,
@@ -326,320 +408,579 @@ def build_models(is_binary: bool) -> Dict[str, object]:
             objective=xgb_obj,
             eval_metric="logloss",
             tree_method="hist",
-            random_state=RANDOM_STATE,
+            random_state=random_state,
             n_jobs=-1,
         ),
         "HGB": HistGradientBoostingClassifier(
-            random_state=RANDOM_STATE,
+            max_depth=None,
+            random_state=random_state,
         ),
         "CB": CatBoostClassifier(
             iterations=300,
             depth=6,
             learning_rate=0.05,
             loss_function=cb_loss,
-            random_state=RANDOM_STATE,
+            random_state=random_state,
             verbose=False,
         ),
     }
     return models
 
 
-def compute_fold_metrics(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    y_proba: Optional[np.ndarray],
-    is_binary: bool,
-) -> Dict[str, float]:
-    """Compute evaluation metrics for one fold.
+def build_regression_models() -> Dict[str, object]:
+    """Build regression models according to REGRESSION_MODELS."""
+    models: Dict[str, object] = {}
 
-    Args:
-        y_true: True labels.
-        y_pred: Predicted labels.
-        y_proba: Predicted probabilities (can be None).
-        is_binary: Whether the problem is binary.
+    if "RF_REG" in REGRESSION_MODELS:
+        models["RF_REG"] = RandomForestRegressor(
+            n_estimators=300,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+    if "LGBM_REG" in REGRESSION_MODELS:
+        models["LGBM_REG"] = LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+    if "XGB_REG" in REGRESSION_MODELS:
+        models["XGB_REG"] = XGBRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method="hist",
+            random_state=random_state,
+            n_jobs=-1,
+        )
+    if "HGB_REG" in REGRESSION_MODELS:
+        models["HGB_REG"] = HistGradientBoostingRegressor(
+            max_depth=None,
+            random_state=random_state,
+        )
+    if "CB_REG" in REGRESSION_MODELS:
+        models["CB_REG"] = CatBoostRegressor(
+            iterations=300,
+            depth=6,
+            learning_rate=0.05,
+            loss_function="RMSE",
+            random_state=random_state,
+            verbose=False,
+        )
 
-    Returns:
-        Dictionary with accuracy, f1, precision, recall, auc.
-    """
-    average = "binary" if is_binary else "macro"
-    metrics: Dict[str, float] = {}
-    metrics["accuracy"] = accuracy_score(y_true, y_pred)
-    metrics["f1"] = f1_score(y_true, y_pred, average=average, zero_division=0)
-    metrics["precision"] = precision_score(
-        y_true,
-        y_pred,
-        average=average,
-        zero_division=0,
-    )
-    metrics["recall"] = recall_score(
-        y_true,
-        y_pred,
-        average=average,
-        zero_division=0,
-    )
-
-    if y_proba is None:
-        metrics["auc"] = float("nan")
-        return metrics
-
-    try:
-        if is_binary:
-            if y_proba.ndim == 1:
-                metrics["auc"] = roc_auc_score(y_true, y_proba)
-            else:
-                metrics["auc"] = roc_auc_score(y_true, y_proba[:, 1])
-        else:
-            metrics["auc"] = roc_auc_score(
-                y_true,
-                y_proba,
-                multi_class="ovr",
-            )
-    except Exception:
-        metrics["auc"] = float("nan")
-
-    return metrics
+    return models
 
 
-def compute_proba_for_fold(
-    model: object,
-    X_val: pd.DataFrame,
-    is_binary: bool,
-) -> Optional[np.ndarray]:
-    """Compute probabilities for validation set if supported by model."""
-    if not hasattr(model, "predict_proba"):
-        return None
+# ---------------------------------------------------------------------------
+# CV EVALUATION HELPERS
+# ---------------------------------------------------------------------------
 
-    proba = model.predict_proba(X_val)
-    if proba.ndim == 1:
-        return proba
-
-    if is_binary and proba.shape[1] == 2:
-        return proba[:, 1]
-    return proba
-
-
-def cross_validate_target(
-    X: pd.DataFrame,
-    y: pd.Series,
+def eval_classification_model_cv(
+    name: str,
+    model_proto: object,
+    X_num: pd.DataFrame,
     X_cb: pd.DataFrame,
-    cat_cols_cb: List[str],
-    n_splits: int,
+    y: pd.Series,
+    cv: StratifiedKFold,
     logger: logging.Logger,
-) -> Tuple[Optional[str], Dict[str, Dict[str, float]], Dict[str, object]]:
-    """Run CV over all models for one target.
+) -> Dict[str, float]:
+    """Cross-validate one classification model."""
+    f1_scores: List[float] = []
+    precision_scores: List[float] = []
+    recall_scores: List[float] = []
+    accuracy_scores: List[float] = []
+    auc_scores: List[float] = []
 
-    Args:
-        X: Numeric feature view.
-        y: Encoded labels.
-        X_cb: CatBoost feature view.
-        cat_cols_cb: CatBoost categorical columns.
-        n_splits: Number of CV folds.
-        logger: Logger for this target.
-
-    Returns:
-        best_model_name, metrics_per_model, trained_models_on_full_data.
-    """
     is_binary = y.nunique() == 2
-    models_proto = build_models(is_binary=is_binary)
-    cv = StratifiedKFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=RANDOM_STATE,
-    )
 
-    cat_indices = [X_cb.columns.get_loc(c) for c in cat_cols_cb]
-    model_results: Dict[str, Dict[str, float]] = {}
-    best_model_name: Optional[str] = None
-    best_f1 = -np.inf
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X_num, y), start=1):
+        X_train_num = X_num.iloc[train_idx]
+        X_val_num = X_num.iloc[val_idx]
+        X_train_cb = X_cb.iloc[train_idx]
+        X_val_cb = X_cb.iloc[val_idx]
+        y_train = y.iloc[train_idx]
+        y_val = y.iloc[val_idx]
 
-    for name, proto in models_proto.items():
-        logger.info("Cross-validating model: %s", name)
-        fold_metrics: List[Dict[str, float]] = []
-
-        for fold_idx, (train_idx, val_idx) in enumerate(
-            cv.split(X, y),
-            start=1,
-        ):
-            logger.info("  Fold %d/%d for %s", fold_idx, n_splits, name)
-            if name == "CB":
-                X_train = X_cb.iloc[train_idx]
-                X_val = X_cb.iloc[val_idx]
+        if name == "CB":
+            cb_cat_cols = X_cb.select_dtypes(include=["string"]).columns.tolist()
+            cat_indices = [X_cb.columns.get_loc(col) for col in cb_cat_cols]
+            model = CatBoostClassifier(**model_proto.get_params())
+            model.fit(
+                X_train_cb,
+                y_train,
+                cat_features=cat_indices if cat_indices else None,
+                verbose=False,
+            )
+            y_pred = model.predict(X_val_cb)
+            proba = model.predict_proba(X_val_cb)
+        else:
+            if name == "HGB":
+                model = HistGradientBoostingClassifier(**model_proto.get_params())
+                model.fit(X_train_num, y_train)
+                proba = model.predict_proba(X_val_num)
+                y_pred = np.argmax(proba, axis=1)
+            elif name == "LGBM":
+                model = LGBMClassifier(**model_proto.get_params())
+                model.fit(X_train_num, y_train)
+                proba = model.predict_proba(X_val_num)
+                y_pred = np.argmax(proba, axis=1)
+            elif name == "RF":
+                model = RandomForestClassifier(**model_proto.get_params())
+                model.fit(X_train_num, y_train)
+                proba = model.predict_proba(X_val_num)
+                y_pred = model.predict(X_val_num)
+            elif name == "XGB":
+                model = XGBClassifier(**model_proto.get_params())
+                model.fit(X_train_num, y_train)
+                proba = model.predict_proba(X_val_num)
+                y_pred = np.argmax(proba, axis=1)
             else:
-                X_train = X.iloc[train_idx]
-                X_val = X.iloc[val_idx]
+                raise ValueError(f"Unknown classification model name: {name}")
 
-            y_train = y.iloc[train_idx]
-            y_val = y.iloc[val_idx]
+        f1_scores.append(f1_score(y_val, y_pred, average="macro"))
+        precision_scores.append(
+            precision_score(y_val, y_pred, average="macro", zero_division=0),
+        )
+        recall_scores.append(
+            recall_score(y_val, y_pred, average="macro", zero_division=0),
+        )
+        accuracy_scores.append(accuracy_score(y_val, y_pred))
 
-            model = proto.__class__(**proto.get_params())
-            if name == "CB":
-                model.fit(
-                    X_train,
-                    y_train,
-                    cat_features=cat_indices if cat_indices else None,
+        try:
+            if is_binary:
+                auc_scores.append(
+                    roc_auc_score(y_val, proba[:, 1]),
                 )
             else:
-                model.fit(X_train, y_train)
-
-            y_pred = model.predict(X_val)
-            y_proba = compute_proba_for_fold(model, X_val, is_binary)
-            metrics = compute_fold_metrics(
-                y_true=y_val.to_numpy(),
-                y_pred=y_pred,
-                y_proba=y_proba,
-                is_binary=is_binary,
+                auc_scores.append(
+                    roc_auc_score(y_val, proba, multi_class="ovr"),
+                )
+        except Exception as exc:  # pragma: no cover - rare case
+            logger.warning(
+                "AUC computation failed for model %s, fold %d: %s",
+                name,
+                fold,
+                exc,
             )
-            fold_metrics.append(metrics)
 
-        agg = {
-            metric_name: float(np.nanmean([m[metric_name] for m in fold_metrics]))
-            for metric_name in fold_metrics[0].keys()
+    return {
+        "f1_macro": float(np.mean(f1_scores)),
+        "precision_macro": float(np.mean(precision_scores)),
+        "recall_macro": float(np.mean(recall_scores)),
+        "accuracy": float(np.mean(accuracy_scores)),
+        "auc": float(np.mean(auc_scores)) if auc_scores else float("nan"),
+    }
+
+
+def eval_regression_model_cv(
+    name: str,
+    model_proto: object,
+    X_num: pd.DataFrame,
+    y: pd.Series,
+    cv: KFold,
+) -> Dict[str, float]:
+    """Cross-validate one regression model."""
+    rmse_scores: List[float] = []
+    mae_scores: List[float] = []
+    r2_scores: List[float] = []
+
+    for train_idx, val_idx in cv.split(X_num):
+        X_train = X_num.iloc[train_idx]
+        X_val = X_num.iloc[val_idx]
+        y_train = y.iloc[train_idx]
+        y_val = y.iloc[val_idx]
+
+        if name == "RF_REG":
+            model = RandomForestRegressor(**model_proto.get_params())
+        elif name == "LGBM_REG":
+            model = LGBMRegressor(**model_proto.get_params())
+        elif name == "XGB_REG":
+            model = XGBRegressor(**model_proto.get_params())
+        elif name == "HGB_REG":
+            model = HistGradientBoostingRegressor(**model_proto.get_params())
+        elif name == "CB_REG":
+            model = CatBoostRegressor(**model_proto.get_params())
+        else:
+            raise ValueError(f"Unknown regression model name: {name}")
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+
+        rmse_scores.append(mean_squared_error(y_val, y_pred, squared=False))
+        mae_scores.append(mean_absolute_error(y_val, y_pred))
+        r2_scores.append(r2_score(y_val, y_pred))
+
+    return {
+        "rmse": float(np.mean(rmse_scores)),
+        "mae": float(np.mean(mae_scores)),
+        "r2": float(np.mean(r2_scores)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PER-TARGET PROCESSING
+# ---------------------------------------------------------------------------
+
+def process_target(
+    y_col: str,
+    df: pd.DataFrame,
+    id_cols: List[str],
+    base_ft_cols: List[str],
+) -> Dict[str, object]:
+    """Process one target for Stage-2 training."""
+    logger = get_target_logger(y_col)
+    logger.info("=== Stage-2 training for %s (mode=%s) ===", y_col, TASK_MODE)
+
+    df_target = df[df[y_col].notna()].copy()
+    n_rows = df_target.shape[0]
+    if n_rows < min_samples_per_target:
+        logger.warning(
+            "Skipping %s: only %d labelled rows (< %d).",
+            y_col,
+            n_rows,
+            min_samples_per_target,
+        )
+        return {
+            "target": y_col,
+            "skipped": True,
+            "reason": "too_few_rows",
+            "n_rows": int(n_rows),
         }
-        agg["n_splits"] = float(n_splits)
-        model_results[name] = agg
-        logger.info("Aggregated CV metrics for %s: %s", name, agg)
 
-        if agg["f1"] > best_f1:
-            best_f1 = agg["f1"]
-            best_model_name = name
+    y_raw = df_target[y_col]
 
-    if best_model_name is None:
-        logger.warning("No valid model found (all F1 were -inf).")
-        return None, model_results, {}
+    if TASK_MODE == "regression":
+        if not pd.api.types.is_numeric_dtype(y_raw):
+            logger.warning(
+                "Skipping %s: non-numeric target in regression mode.",
+                y_col,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "non_numeric_target_regression",
+                "n_rows": int(n_rows),
+            }
 
-    logger.info("Best model: %s (F1=%.4f)", best_model_name, best_f1)
+        nunique = y_raw.nunique(dropna=True)
+        if nunique <= REGRESSION_MIN_UNIQUE:
+            logger.warning(
+                (
+                    "Skipping %s: only %d unique numeric values (<= %d); "
+                    "treated as categorical, not regression."
+                ),
+                y_col,
+                nunique,
+                REGRESSION_MIN_UNIQUE,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "too_few_unique_for_regression",
+                "n_rows": int(n_rows),
+            }
 
-    # Refit all models on full data.
-    trained_models: Dict[str, object] = {}
-    for name, proto in models_proto.items():
-        logger.info("Refitting full model: %s", name)
-        model = proto.__class__(**proto.get_params())
+        y = pd.to_numeric(y_raw, errors="coerce")
+        valid_mask = y.notna()
+        df_target = df_target[valid_mask]
+        y = y[valid_mask]
+        n_rows = df_target.shape[0]
+
+        if n_rows < min_samples_per_target:
+            logger.warning(
+                "Skipping %s: only %d valid rows (< %d) after coercion.",
+                y_col,
+                n_rows,
+                min_samples_per_target,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "too_few_rows_after_coerce",
+                "n_rows": int(n_rows),
+            }
+
+        logger.info(
+            "Regression target %s accepted: %d unique values, %d usable rows.",
+            y_col,
+            nunique,
+            n_rows,
+        )
+
+        cv = choose_kfold_regression(n_rows, logger)
+        if cv is None:
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "cv_failed",
+                "n_rows": int(n_rows),
+            }
+
+    else:
+        # classification
+        y = y_raw.astype(str)
+        counts = y.value_counts()
+        n_classes = counts.shape[0]
+        min_class = int(counts.min())
+
+        logger.info(
+            "Classification target %s: n_classes=%d, min_class=%d, counts=%s",
+            y_col,
+            n_classes,
+            min_class,
+            counts.to_dict(),
+        )
+
+        if n_classes < 2:
+            logger.warning("Skipping %s: only one class.", y_col)
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "single_class",
+                "n_rows": int(n_rows),
+            }
+
+        if min_class < min_class_count_for_training:
+            logger.warning(
+                "Skipping %s: min_class=%d (< %d).",
+                y_col,
+                min_class,
+                min_class_count_for_training,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "rare_class",
+                "n_rows": int(n_rows),
+            }
+
+        y_enc = pd.Series(
+            pd.factorize(y, sort=True)[0],
+            index=y.index,
+            dtype="int64",
+        )
+        y = y_enc
+
+        cv = choose_stratified_cv(y, logger)
+        if cv is None:
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "cv_failed",
+                "n_rows": int(n_rows),
+            }
+
+    selected_features = load_feature_importances_for_target(
+        y_col=y_col,
+        task_mode=TASK_MODE,
+        logger=logger,
+    )
+    if not selected_features:
+        return {
+            "target": y_col,
+            "skipped": True,
+            "reason": "no_features_selected",
+            "n_rows": int(n_rows),
+        }
+
+    all_features = [c for c in base_ft_cols if c in selected_features]
+    if not all_features:
+        logger.warning(
+            "None of the selected features for %s are in base_ft_cols; skipping.",
+            y_col,
+        )
+        return {
+            "target": y_col,
+            "skipped": True,
+            "reason": "selected_features_not_in_df",
+            "n_rows": int(n_rows),
+        }
+
+    X = df_target[all_features].copy()
+
+    run = None
+    if use_mlflow and mlflow_available and mlflow is not None:
+        run = mlflow.start_run(run_name=f"stage2_{y_col}", nested=False)
+        mlflow.log_param("target", y_col)
+        mlflow.log_param("task_mode", TASK_MODE)
+        mlflow.log_param("n_rows", int(n_rows))
+        mlflow.log_param("n_features", len(all_features))
+        mlflow.log_param("selected_features", ",".join(all_features))
+
+    if TASK_MODE == "regression":
+        # -------- Regression branch --------
+        X_num = prepare_view_regression(X, y)
+        models = build_regression_models()
+        if not models:
+            logger.warning(
+                "No regression models enabled in REGRESSION_MODELS; skipping %s.",
+                y_col,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "no_regression_models",
+                "n_rows": int(n_rows),
+            }
+
+        model_metrics: Dict[str, Dict[str, float]] = {}
+        for name, proto in models.items():
+            logger.info("CV for regression model %s on %s", name, y_col)
+            metrics = eval_regression_model_cv(
+                name=name,
+                model_proto=proto,
+                X_num=X_num,
+                y=y,
+                cv=cv,
+            )
+            model_metrics[name] = metrics
+            logger.info("CV metrics for %s on %s: %s", name, y_col, metrics)
+
+        # Best by lowest RMSE
+        best_name = min(
+            model_metrics.items(),
+            key=lambda kv: kv[1]["rmse"],
+        )[0]
+        logger.info("Best regression model for %s is %s", y_col, best_name)
+
+        fitted_paths: Dict[str, str] = {}
+
+        for name, proto in models.items():
+            if name == "RF_REG":
+                model = RandomForestRegressor(**proto.get_params())
+            elif name == "LGBM_REG":
+                model = LGBMRegressor(**proto.get_params())
+            elif name == "XGB_REG":
+                model = XGBRegressor(**proto.get_params())
+            elif name == "HGB_REG":
+                model = HistGradientBoostingRegressor(**proto.get_params())
+            elif name == "CB_REG":
+                model = CatBoostRegressor(**proto.get_params())
+            else:
+                continue
+
+            model.fit(X_num, y)
+            out_path = models_dir / f"{y_col}_{name}.joblib"
+            dump(model, out_path)
+            fitted_paths[name] = str(out_path)
+            logger.info("Saved regression model %s for %s to %s", name, y_col, out_path)
+
+        # Best model alias
+        best_src_path = fitted_paths[best_name]
+        best_model = load(best_src_path)
+        best_path = models_dir / f"{y_col}_best.joblib"
+        dump(best_model, best_path)
+        logger.info("Saved best regression model alias for %s to %s", y_col, best_path)
+
+        if use_mlflow and mlflow_available and run is not None and mlflow is not None:
+            best_metrics = model_metrics[best_name]
+            mlflow.log_metrics(best_metrics)
+            mlflow.log_param("best_model", best_name)
+            mlflow.end_run()
+
+        flat_metrics: Dict[str, float] = {}
+        for name, metrics in model_metrics.items():
+            for key, val in metrics.items():
+                flat_metrics[f"{name}_{key}"] = val
+
+        return {
+            "target": y_col,
+            "skipped": False,
+            "reason": "",
+            "n_rows": int(n_rows),
+            "task_mode": TASK_MODE,
+            "best_model": best_name,
+            **flat_metrics,
+        }
+
+    # -------- Classification branch --------
+    X_num, X_cb = prepare_views_classification(X, y)
+    models = build_classification_models(is_binary=y.nunique() == 2)
+
+    model_metrics_cls: Dict[str, Dict[str, float]] = {}
+    for name, proto in models.items():
+        logger.info("CV for classification model %s on %s", name, y_col)
+        metrics = eval_classification_model_cv(
+            name=name,
+            model_proto=proto,
+            X_num=X_num,
+            X_cb=X_cb,
+            y=y,
+            cv=cv,
+            logger=logger,
+        )
+        model_metrics_cls[name] = metrics
+        logger.info("CV metrics for %s on %s: %s", name, y_col, metrics)
+
+    best_name = max(
+        model_metrics_cls.items(),
+        key=lambda kv: kv[1]["f1_macro"],
+    )[0]
+    logger.info("Best classification model for %s is %s", y_col, best_name)
+
+    fitted_paths_cls: Dict[str, str] = {}
+
+    for name, proto in models.items():
         if name == "CB":
+            cb_cat_cols = X_cb.select_dtypes(include=["string"]).columns.tolist()
+            cat_indices = [X_cb.columns.get_loc(col) for col in cb_cat_cols]
+            model = CatBoostClassifier(**proto.get_params())
             model.fit(
                 X_cb,
                 y,
                 cat_features=cat_indices if cat_indices else None,
+                verbose=False,
             )
+        elif name == "HGB":
+            model = HistGradientBoostingClassifier(**proto.get_params())
+            model.fit(X_num, y)
+        elif name == "LGBM":
+            model = LGBMClassifier(**proto.get_params())
+            model.fit(X_num, y)
+        elif name == "RF":
+            model = RandomForestClassifier(**proto.get_params())
+            model.fit(X_num, y)
+        elif name == "XGB":
+            model = XGBClassifier(**proto.get_params())
+            model.fit(X_num, y)
         else:
-            X_num_full = prepare_numeric_view(X)
-            model.fit(X_num_full, y)
-        trained_models[name] = model
+            continue
 
-    return best_model_name, model_results, trained_models
+        out_path = models_dir / f"{y_col}_{name}.joblib"
+        dump(model, out_path)
+        fitted_paths_cls[name] = str(out_path)
+        logger.info("Saved classification model %s for %s to %s", name, y_col, out_path)
 
+    best_src_path_cls = fitted_paths_cls[best_name]
+    best_model_cls = load(best_src_path_cls)
+    best_path_cls = models_dir / f"{y_col}_best.joblib"
+    dump(best_model_cls, best_path_cls)
+    logger.info("Saved best classification model alias for %s to %s", y_col, best_path_cls)
 
-# ---------------------------------------------------------------------------
-# PER-TARGET PIPELINE
-# ---------------------------------------------------------------------------
+    if use_mlflow and mlflow_available and run is not None and mlflow is not None:
+        best_metrics_cls = model_metrics_cls[best_name]
+        mlflow.log_metrics(best_metrics_cls)
+        mlflow.log_param("best_model", best_name)
+        mlflow.end_run()
 
-def process_target(y_col: str, df: pd.DataFrame) -> Dict[str, object]:
-    """Process training for a single target column.
+    flat_metrics_cls: Dict[str, float] = {}
+    for name, metrics in model_metrics_cls.items():
+        for key, val in metrics.items():
+            flat_metrics_cls[f"{name}_{key}"] = val
 
-    Args:
-        y_col: Target column name.
-        df: Full dataframe.
-
-    Returns:
-        Record describing processing result for this target.
-    """
-    logger = get_target_logger(y_col)
-    logger.info("=== Stage-2 training for %s ===", y_col)
-
-    df_t = df[df[y_col].notna()].copy()
-    n_rows = df_t.shape[0]
-    if n_rows < 2:
-        logger.warning("Skipping %s: only %d labelled rows (< 2).", y_col, n_rows)
-        return {"target": y_col, "skipped": True, "reason": "too_few_rows"}
-
-    selected_features = load_selected_features(y_col, logger)
-    if not selected_features:
-        logger.warning("Skipping %s: no selected features.", y_col)
-        return {"target": y_col, "skipped": True, "reason": "no_selected_features"}
-
-    missing = [f for f in selected_features if f not in df.columns]
-    if missing:
-        logger.warning(
-            "Skipping %s: missing features in data: %s",
-            y_col,
-            missing,
-        )
-        return {"target": y_col, "skipped": True, "reason": "missing_features"}
-
-    X = df_t[selected_features].copy()
-    y_raw = df_t[y_col]
-
-    y_enc, encoder, n_splits = prepare_target_and_cv(y_raw, logger)
-    if y_enc is None or encoder is None or n_splits is None:
-        return {"target": y_col, "skipped": True, "reason": "bad_class_distribution"}
-
-    X_cb, cat_cols_cb = prepare_catboost_view(X)
-    X_num = prepare_numeric_view(X)
-
-    # Optional MLflow logging for this target.
-    run = None
-    if USE_MLFLOW and MLFLOW_AVAILABLE:
-        if mlflow is not None:
-            run = mlflow.start_run(run_name=f"stage2_{y_col}", nested=False)
-            mlflow.log_param("target", y_col)
-            mlflow.log_param("n_rows", int(n_rows))
-            mlflow.log_param("n_features", int(X_num.shape[1]))
-            mlflow.log_param("n_splits", int(n_splits))
-
-    best_model_name, metrics_per_model, trained_models = cross_validate_target(
-        X=X_num,
-        y=y_enc,
-        X_cb=X_cb,
-        cat_cols_cb=cat_cols_cb,
-        n_splits=n_splits,
-        logger=logger,
-    )
-
-    if not trained_models or best_model_name is None:
-        logger.warning("No trained models produced for %s.", y_col)
-        if USE_MLFLOW and MLFLOW_AVAILABLE and run is not None and mlflow is not None:
-            mlflow.set_tag("status", "no_valid_model")
-            mlflow.end_run()
-        return {"target": y_col, "skipped": True, "reason": "no_valid_model"}
-
-    # Save all model files.
-    for model_name, est in trained_models.items():
-        model_path = TRAINED_MODELS_DIR / f"{y_col}_{model_name}.joblib"
-        joblib.dump(est, model_path)
-        logger.info("Saved %s model for %s to %s", model_name, y_col, model_path)
-
-    # Save alias for best model.
-    best_model = trained_models[best_model_name]
-    best_path = TRAINED_MODELS_DIR / f"{y_col}_best.joblib"
-    joblib.dump(best_model, best_path)
-    logger.info("Saved BEST model (%s) for %s to %s", best_model_name, y_col, best_path)
-
-    best_metrics = metrics_per_model[best_model_name]
-    record: Dict[str, object] = {
+    return {
         "target": y_col,
         "skipped": False,
         "reason": "",
-        "best_model": best_model_name,
-        "n_splits": best_metrics.get("n_splits", float(n_splits)),
-        "f1": best_metrics.get("f1", float("nan")),
-        "precision": best_metrics.get("precision", float("nan")),
-        "recall": best_metrics.get("recall", float("nan")),
-        "accuracy": best_metrics.get("accuracy", float("nan")),
-        "auc": best_metrics.get("auc", float("nan")),
+        "n_rows": int(n_rows),
+        "task_mode": TASK_MODE,
+        "best_model": best_name,
+        **flat_metrics_cls,
     }
-    logger.info("Final record for %s: %s", y_col, record)
-
-    if USE_MLFLOW and MLFLOW_AVAILABLE and run is not None and mlflow is not None:
-        mlflow.log_param("best_model", best_model_name)
-        mlflow.log_metric("f1", float(record["f1"]))
-        mlflow.log_metric("precision", float(record["precision"]))
-        mlflow.log_metric("recall", float(record["recall"]))
-        mlflow.log_metric("accuracy", float(record["accuracy"]))
-        if not np.isnan(record["auc"]):  # type: ignore[arg-type]
-            mlflow.log_metric("auc", float(record["auc"]))
-        mlflow.set_tag("status", "success")
-        mlflow.end_run()
-
-    return record
 
 
 # ---------------------------------------------------------------------------
@@ -647,58 +988,53 @@ def process_target(y_col: str, df: pd.DataFrame) -> Dict[str, object]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Run Stage-2 model training over all y_* targets."""
-    LOG.info("Loading data from %s", DATA_PATH)
-    df = pd.read_csv(DATA_PATH, low_memory=False)
+    """Run Stage-2 training over all y_* targets."""
+    log.info("Loading data from %s", data_path)
+    df = pd.read_csv(data_path, low_memory=False)
+
     id_cols, ft_cols, y_cols = detect_columns(df)
-    LOG.info(
+    log.info(
         "Detected %d id_, %d ft_, %d y_ columns.",
         len(id_cols),
         len(ft_cols),
         len(y_cols),
     )
 
-    if not y_cols:
-        LOG.error("No y_ columns found; aborting Stage-2.")
+    if not ft_cols or not y_cols:
+        log.error("No ft_ or y_ columns detected; aborting.")
         return
 
-    if USE_MLFLOW and MLFLOW_AVAILABLE and mlflow is not None:
-        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    if use_mlflow and mlflow_available and mlflow is not None:
+        mlflow.set_experiment(mlflow_experiment_name)
 
-    LOG.info(
-        "Starting Stage-2 for %d targets with N_JOBS_TARGETS=%d.",
+    log.info(
+        "Starting Stage-2 over %d targets with n_jobs_targets=%d (mode=%s).",
         len(y_cols),
-        N_JOBS_TARGETS,
+        n_jobs_targets,
+        TASK_MODE,
     )
 
-    results = Parallel(n_jobs=N_JOBS_TARGETS)(
-        delayed(process_target)(y_col, df) for y_col in y_cols
+    results = Parallel(n_jobs=n_jobs_targets)(
+        delayed(process_target)(y_col, df, id_cols, ft_cols) for y_col in y_cols
     )
 
-    processed = [r for r in results if not r.get("skipped", False)]
-    skipped = [r for r in results if r.get("skipped", False)]
-
-    if processed:
-        df_processed = pd.DataFrame(processed)
-        df_processed.to_csv(RESULTS_CSV, index=False)
-        with open(RESULTS_JSON, "w", encoding="utf-8") as f:
-            json.dump(processed, f, indent=2)
-        LOG.info(
-            "Saved Stage-2 metrics to %s and %s.",
-            RESULTS_CSV,
-            RESULTS_JSON,
-        )
-    else:
-        LOG.warning("No targets successfully trained in Stage-2.")
+    skipped = [r for r in results if r.get("skipped")]
+    processed = [r for r in results if not r.get("skipped")]
 
     if skipped:
-        df_skipped = pd.DataFrame(skipped)
-        df_skipped.to_csv(SKIPPED_CSV, index=False)
-        LOG.info("Saved skipped targets to %s.", SKIPPED_CSV)
-    else:
-        LOG.info("No targets skipped in Stage-2.")
+        pd.DataFrame(skipped).to_csv(skipped_targets_csv, index=False)
+        log.info("Saved skipped targets summary to %s", skipped_targets_csv)
 
-    LOG.info(
+    if processed:
+        df_cv = pd.DataFrame(processed)
+        df_cv.to_csv(cv_results_csv, index=False)
+        with cv_results_json.open("w", encoding="utf-8") as f:
+            json.dump(processed, f, indent=2)
+        log.info("Saved CV results to %s and %s", cv_results_csv, cv_results_json)
+    else:
+        log.warning("No targets were successfully processed in Stage-2.")
+
+    log.info(
         "Stage-2 completed: %d processed, %d skipped.",
         len(processed),
         len(skipped),
