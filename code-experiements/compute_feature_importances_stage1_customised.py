@@ -13,6 +13,7 @@ This script:
 - In regression mode:
     * Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
     * Skips non-numeric targets.
+    * Skips numeric targets with too few unique values (<= REGRESSION_MIN_UNIQUE).
 - Cleans features globally (variance + correlation) and
   per-target (missing thresholds).
 - Builds two feature views per target:
@@ -132,6 +133,9 @@ missing_thresh = 0.8
 # Target skipping
 min_samples_per_target = 200
 min_class_count_for_importance = 2  # only used in classification mode
+
+# Minimum unique numeric values to consider a target as regression
+REGRESSION_MIN_UNIQUE = 10
 
 cpu_count = os.cpu_count() or 4
 n_jobs_targets = max(min(cpu_count - 1, 16), 2)
@@ -591,6 +595,25 @@ def process_target(
                 "reason": "non_numeric_target_regression",
                 "n_rows": int(n_rows),
             }
+
+        nunique = y_raw.nunique(dropna=True)
+        if nunique <= REGRESSION_MIN_UNIQUE:
+            logger.warning(
+                (
+                    "Skipping %s: only %d unique numeric values (<= %d); "
+                    "treated as categorical, not regression."
+                ),
+                y_col,
+                nunique,
+                REGRESSION_MIN_UNIQUE,
+            )
+            return {
+                "target": y_col,
+                "skipped": True,
+                "reason": "too_few_unique_for_regression",
+                "n_rows": int(n_rows),
+            }
+
         y_reg = pd.to_numeric(y_raw, errors="coerce")
         if y_reg.isna().all():
             logger.warning(
@@ -603,15 +626,12 @@ def process_target(
                 "reason": "all_nan_after_coerce",
                 "n_rows": int(n_rows),
             }
-        y_valid_mask = y_reg.notna()
-        df_target = df_target[y_valid_mask]
-        y_reg = y_reg[y_valid_mask]
+
+        valid_mask = y_reg.notna()
+        df_target = df_target[valid_mask]
+        y_reg = y_reg[valid_mask]
         n_rows = df_target.shape[0]
-        logger.info(
-            "Regression target %s: %d valid numeric rows after coercion.",
-            y_col,
-            n_rows,
-        )
+
         if n_rows < min_samples_per_target:
             logger.warning(
                 "Skipping %s: only %d valid rows (< %d) after coercion.",
@@ -625,6 +645,14 @@ def process_target(
                 "reason": "too_few_rows_after_coerce",
                 "n_rows": int(n_rows),
             }
+
+        logger.info(
+            "Regression target %s accepted: %d unique values, %d usable rows.",
+            y_col,
+            nunique,
+            n_rows,
+        )
+
         y_for_encoding = y_reg
         n_classes = 0
         min_class = 0
