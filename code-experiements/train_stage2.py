@@ -1,69 +1,37 @@
 #!/usr/bin/env python3
 """
-Stage-2: Per-target model training with dynamic CV folds and
-consistent classification/regression logic mirroring Stage-1.
+Stage-2: Per-target classification model training with dynamic CV folds.
 
 This script:
 
 - Uses feature_importances_<y>.csv from Stage-1 to choose features per target.
-- Supports two global modes (matching Stage-1):
-
-    TASK_MODE = "classification"
-        * All y_* treated as classification targets.
-        * For each y_*:
-            - Filters non-missing rows.
-            - Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
-            - Skips targets with only one class or smallest class too small.
-            - Loads feature_importances_<y>.csv and selects features where:
-                RF > 0 & LGBM > 0 & CB > 0 & XGB > 0 & HGB > 0.
-            - Builds two feature views:
-                - Numeric (CatBoostEncoder) for RF / LGBM / XGB / HGB.
-                - Raw string categorical view for CatBoost.
-            - Chooses dynamic n_splits as:
-                n_splits = min(MAX_N_SPLITS_CLASSIFICATION, min_class_count)
-                (must be >= 2).
-            - Cross-validates all 5 models and computes metrics:
-                F1 (macro), Precision (macro), Recall (macro),
-                Accuracy, AUC (binary or multiclass).
-            - Selects best model by F1.
-            - Refits ALL 5 models on full data.
-            - Saves:
-                trained_models/y_<target>_RF.joblib
-                trained_models/y_<target>_LGBM.joblib
-                trained_models/y_<target>_XGB.joblib
-                trained_models/y_<target>_HGB.joblib
-                trained_models/y_<target>_CB.joblib
-                trained_models/y_<target>_best.joblib
-
-    TASK_MODE = "regression"
-        * All y_* treated as regression candidates.
-        * For each y_*:
-            - Filters non-missing rows.
-            - Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
-            - Skips non-numeric targets.
-            - Skips numeric targets with too few unique values
-              (<= REGRESSION_MIN_UNIQUE).
-            - Loads feature_importances_<y>.csv and selects features where:
-                RF_REG > 0.
-            - Builds numeric CatBoostEncoder view.
-            - Uses KFold with dynamic n_splits:
-                n_splits = min(MAX_N_SPLITS_REGRESSION, n_samples)
-                (must be >= 2).
-            - Cross-validates regression models (currently only):
-                * RF_REG   → RandomForestRegressor
-            - Computes metrics:
-                RMSE, MAE, R2.
-            - Selects best model by lowest RMSE.
-            - Refits RF_REG on full data.
-            - Saves:
-                trained_models/y_<target>_RF_REG.joblib
-                trained_models/y_<target>_best.joblib (best model alias)
+- Classification only (no regression).
+- For each y_* target:
+    * Filters non-missing rows.
+    * Skips targets with fewer than MIN_SAMPLES_PER_TARGET rows.
+    * Skips targets with only one class or smallest class too small.
+    * Loads feature_importances_<y>.csv and selects features where:
+        RF > 0 & LGBM > 0 & CB > 0 & XGB > 0 & HGB > 0.
+    * Builds two feature views:
+        - Numeric (CatBoostEncoder) for RF / LGBM / XGB / HGB.
+        - Raw string categorical view for CatBoost.
+    * Chooses dynamic n_splits as:
+        n_splits = min(MAX_N_SPLITS_CLASSIFICATION, min_class_count)
+        (must be >= 2).
+    * Cross-validates all ENABLED_MODELS and computes metrics:
+        F1 (macro), Precision (macro), Recall (macro),
+        Accuracy, AUC (binary or multiclass).
+    * Selects best model by F1.
+    * Refits all ENABLED_MODELS on full data.
+    * Saves:
+        trained_models/y_<target>_<MODEL>.joblib
+        trained_models/y_<target>_best.joblib
 
 Outputs:
 
-- model_cv_results_parallel.csv
-- model_cv_results_parallel.json
-- skipped_targets_stage2.csv
+- trained_models/model_cv_results_parallel.csv
+- trained_models/model_cv_results_parallel.json
+- trained_models/skipped_targets_stage2.csv
 - logs/y_<target>_stage2.log (per-target logging)
 
 Optional:
@@ -82,27 +50,22 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from category_encoders import CatBoostEncoder
-from catboost import CatBoostClassifier, CatBoostRegressor
+from catboost import CatBoostClassifier
 from joblib import Parallel, delayed, dump, load
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import (
     HistGradientBoostingClassifier,
-    HistGradientBoostingRegressor,
     RandomForestClassifier,
-    RandomForestRegressor,
 )
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
-    mean_absolute_error,
-    mean_squared_error,
     precision_score,
-    r2_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import KFold, StratifiedKFold
-from xgboost import XGBClassifier, XGBRegressor
+from sklearn.model_selection import StratifiedKFold
+from xgboost import XGBClassifier
 
 # Optional MLflow
 try:
@@ -117,53 +80,42 @@ except Exception:  # pragma: no cover - optional
 # CONFIG
 # ---------------------------------------------------------------------------
 
-# Global task mode (must match Stage-1):
-#   "classification" → all targets treated as classification
-#   "regression"     → all targets treated as regression (numeric only)
-TASK_MODE = "classification"  # or "regression"
+DATA_PATH = "input_data.csv"
+FEATURE_IMPORTANCE_DIR = Path("feature_importances")
+MODELS_DIR = Path("trained_models")
+LOG_DIR = Path("logs")
 
-data_path = "input_data.csv"
-feature_importance_dir = Path("feature_importances")
-models_dir = Path("trained_models")
-log_dir = Path("logs")
+ID_PREFIX = "id_"
+FEATURE_PREFIX = "ft_"
+TARGET_PREFIX = "y_"
 
-id_prefix = "id_"
-feature_prefix = "ft_"
-target_prefix = "y_"
+RANDOM_STATE = 42
 
-random_state = 42
+MIN_SAMPLES_PER_TARGET = 200
+MIN_CLASS_COUNT_FOR_TRAINING = 2
+MAX_N_SPLITS_CLASSIFICATION = 5
 
-min_samples_per_target = 200
-min_class_count_for_training = 2  # classification
+CPU_COUNT = os.cpu_count() or 4
+N_JOBS_TARGETS = max(min(CPU_COUNT - 1, 16), 2)
 
-# Regression unique-values threshold (same as Stage-1).
-# Numeric targets with <= this many unique values are treated as
-# unsuitable for regression and are skipped.
-REGRESSION_MIN_UNIQUE = 10
+USE_CATBOOST_ENCODER = True
+CAT_FILL_VALUE = "NA_CAT"
 
-max_n_splits_classification = 5
-max_n_splits_regression = 5
+# ✔ Select which models to run for classification
+# Any subset of {"RF", "LGBM", "XGB", "HGB", "CB"}.
+ENABLED_MODELS: List[str] = ["RF", "LGBM", "XGB", "HGB", "CB"]
 
-cpu_count = os.cpu_count() or 4
-n_jobs_targets = max(min(cpu_count - 1, 16), 2)
+# MLflow (optional)
+USE_MLFLOW = False
+MLFLOW_EXPERIMENT_NAME = "stage2_model_training"
 
-use_catboost_encoder = True
-cat_fill_value = "NA_CAT"
+FEATURE_IMPORTANCE_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Only RF_REG is enabled for regression for now.
-enabled_regression_models: List[str] = ["RF_REG"]
-
-# MLflow
-use_mlflow = False
-mlflow_experiment_name = "stage2_model_training"
-
-feature_importance_dir.mkdir(parents=True, exist_ok=True)
-models_dir.mkdir(parents=True, exist_ok=True)
-log_dir.mkdir(parents=True, exist_ok=True)
-
-skipped_targets_csv = models_dir / "skipped_targets_stage2.csv"
-cv_results_csv = models_dir / "model_cv_results_parallel.csv"
-cv_results_json = models_dir / "model_cv_results_parallel.json"
+SKIPPED_TARGETS_CSV = MODELS_DIR / "skipped_targets_stage2.csv"
+CV_RESULTS_CSV = MODELS_DIR / "model_cv_results_parallel.csv"
+CV_RESULTS_JSON = MODELS_DIR / "model_cv_results_parallel.json"
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -173,7 +125,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger("stage2")
+LOG = logging.getLogger("stage2")
 
 
 def get_target_logger(y_col: str) -> logging.Logger:
@@ -188,7 +140,7 @@ def get_target_logger(y_col: str) -> logging.Logger:
     )
     if not exists:
         file_handler = logging.FileHandler(
-            log_dir / f"{y_col}_stage2.log",
+            LOG_DIR / f"{y_col}_stage2.log",
             mode="w",
             encoding="utf-8",
         )
@@ -209,19 +161,18 @@ def get_target_logger(y_col: str) -> logging.Logger:
 
 def detect_columns(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
     """Detect id_, ft_, y_ columns by prefix."""
-    id_cols = [c for c in df.columns if c.startswith(id_prefix)]
-    ft_cols = [c for c in df.columns if c.startswith(feature_prefix)]
-    y_cols = [c for c in df.columns if c.startswith(target_prefix)]
+    id_cols = [c for c in df.columns if c.startswith(ID_PREFIX)]
+    ft_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
+    y_cols = [c for c in df.columns if c.startswith(TARGET_PREFIX)]
     return id_cols, ft_cols, y_cols
 
 
 def load_feature_importances_for_target(
     y_col: str,
-    task_mode: str,
     logger: logging.Logger,
 ) -> Optional[List[str]]:
     """Load Stage-1 importance file for y_col and select usable features."""
-    path = feature_importance_dir / f"feature_importances_{y_col}.csv"
+    path = FEATURE_IMPORTANCE_DIR / f"feature_importances_{y_col}.csv"
     if not path.exists():
         logger.warning("No feature_importances file for %s at %s", y_col, path)
         return None
@@ -234,32 +185,23 @@ def load_feature_importances_for_target(
         )
         return None
 
-    if task_mode == "regression":
-        if "RF_REG" not in df_imp.columns:
-            logger.warning(
-                "feature_importances_%s.csv has no 'RF_REG'; skipping.",
-                y_col,
-            )
-            return None
-        mask = df_imp["RF_REG"] > 0
-    else:
-        required = ["RF", "LGBM", "CB", "XGB", "HGB"]
-        missing = [c for c in required if c not in df_imp.columns]
-        if missing:
-            logger.warning(
-                "feature_importances_%s.csv missing columns %s; skipping.",
-                y_col,
-                missing,
-            )
-            return None
-        mask = (
-            (df_imp["RF"] > 0)
-            & (df_imp["LGBM"] > 0)
-            & (df_imp["CB"] > 0)
-            & (df_imp["XGB"] > 0)
-            & (df_imp["HGB"] > 0)
+    required = ["RF", "LGBM", "CB", "XGB", "HGB"]
+    missing = [c for c in required if c not in df_imp.columns]
+    if missing:
+        logger.warning(
+            "feature_importances_%s.csv missing columns %s; skipping.",
+            y_col,
+            missing,
         )
+        return None
 
+    mask = (
+        (df_imp["RF"] > 0)
+        & (df_imp["LGBM"] > 0)
+        & (df_imp["CB"] > 0)
+        & (df_imp["XGB"] > 0)
+        & (df_imp["HGB"] > 0)
+    )
     selected = df_imp.loc[mask, "feature_name"].dropna().unique().tolist()
     if not selected:
         logger.warning(
@@ -284,8 +226,8 @@ def prepare_views_classification(
     numeric = features.copy()
     cat_cols = numeric.select_dtypes(include=["object"]).columns.tolist()
 
-    if use_catboost_encoder and cat_cols:
-        encoder = CatBoostEncoder(cols=cat_cols, random_state=random_state)
+    if USE_CATBOOST_ENCODER and cat_cols:
+        encoder = CatBoostEncoder(cols=cat_cols, random_state=RANDOM_STATE)
         numeric = encoder.fit_transform(numeric, y)
     elif cat_cols:
         numeric = numeric.drop(columns=cat_cols)
@@ -295,27 +237,9 @@ def prepare_views_classification(
     cb_view = features.copy()
     cb_cat_cols = cb_view.select_dtypes(include=["object"]).columns.tolist()
     for col in cb_cat_cols:
-        cb_view[col] = cb_view[col].astype("string").fillna(cat_fill_value)
+        cb_view[col] = cb_view[col].astype("string").fillna(CAT_FILL_VALUE)
 
     return numeric, cb_view
-
-
-def prepare_view_regression(
-    features: pd.DataFrame,
-    y: pd.Series,
-) -> pd.DataFrame:
-    """Prepare numeric CatBoost-encoded view for regression."""
-    numeric = features.copy()
-    cat_cols = numeric.select_dtypes(include=["object"]).columns.tolist()
-
-    if use_catboost_encoder and cat_cols:
-        encoder = CatBoostEncoder(cols=cat_cols, random_state=random_state)
-        numeric = encoder.fit_transform(numeric, y)
-    elif cat_cols:
-        numeric = numeric.drop(columns=cat_cols)
-
-    numeric = numeric.apply(pd.to_numeric, errors="coerce")
-    return numeric
 
 
 def choose_stratified_cv(
@@ -325,7 +249,7 @@ def choose_stratified_cv(
     """Choose dynamic StratifiedKFold for classification based on class counts."""
     counts = y.value_counts()
     min_count = int(counts.min())
-    n_splits = min(max_n_splits_classification, min_count)
+    n_splits = min(MAX_N_SPLITS_CLASSIFICATION, min_count)
 
     logger.info(
         "Class distribution: %s; chosen n_splits=%d",
@@ -343,29 +267,7 @@ def choose_stratified_cv(
     return StratifiedKFold(
         n_splits=n_splits,
         shuffle=True,
-        random_state=random_state,
-    )
-
-
-def choose_kfold_regression(
-    n_samples: int,
-    logger: logging.Logger,
-) -> Optional[KFold]:
-    """Choose dynamic KFold for regression based on sample size."""
-    n_splits = min(max_n_splits_regression, n_samples)
-    logger.info("Regression KFold: n_samples=%d, n_splits=%d", n_samples, n_splits)
-
-    if n_splits < 2:
-        logger.warning(
-            "Cannot build KFold: n_splits=%d < 2; skipping target.",
-            n_splits,
-        )
-        return None
-
-    return KFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=random_state,
+        random_state=RANDOM_STATE,
     )
 
 
@@ -375,7 +277,7 @@ def choose_kfold_regression(
 
 
 def build_classification_models(is_binary: bool) -> Dict[str, object]:
-    """Build classification models (RF, LGBM, XGB, HGB, CB)."""
+    """Build enabled classification models."""
     if is_binary:
         lgbm_obj = "binary"
         xgb_obj = "binary:logistic"
@@ -385,23 +287,29 @@ def build_classification_models(is_binary: bool) -> Dict[str, object]:
         xgb_obj = "multi:softprob"
         cb_loss = "MultiClass"
 
-    models: Dict[str, object] = {
-        "RF": RandomForestClassifier(
+    models: Dict[str, object] = {}
+
+    if "RF" in ENABLED_MODELS:
+        models["RF"] = RandomForestClassifier(
             n_estimators=300,
-            random_state=random_state,
+            random_state=RANDOM_STATE,
             n_jobs=-1,
-        ),
-        "LGBM": LGBMClassifier(
+        )
+
+    if "LGBM" in ENABLED_MODELS:
+        models["LGBM"] = LGBMClassifier(
             n_estimators=300,
             learning_rate=0.05,
             objective=lgbm_obj,
             subsample=0.8,
             colsample_bytree=0.8,
-            random_state=random_state,
+            random_state=RANDOM_STATE,
             n_jobs=-1,
             verbosity=-1,
-        ),
-        "XGB": XGBClassifier(
+        )
+
+    if "XGB" in ENABLED_MODELS:
+        models["XGB"] = XGBClassifier(
             n_estimators=300,
             learning_rate=0.05,
             max_depth=6,
@@ -410,39 +318,31 @@ def build_classification_models(is_binary: bool) -> Dict[str, object]:
             objective=xgb_obj,
             eval_metric="logloss",
             tree_method="hist",
-            random_state=random_state,
+            random_state=RANDOM_STATE,
             n_jobs=-1,
-        ),
-        "HGB": HistGradientBoostingClassifier(
+        )
+
+    if "HGB" in ENABLED_MODELS:
+        models["HGB"] = HistGradientBoostingClassifier(
             max_depth=None,
-            random_state=random_state,
-        ),
-        "CB": CatBoostClassifier(
+            random_state=RANDOM_STATE,
+        )
+
+    if "CB" in ENABLED_MODELS:
+        models["CB"] = CatBoostClassifier(
             iterations=300,
             depth=6,
             learning_rate=0.05,
             loss_function=cb_loss,
-            random_state=random_state,
+            random_state=RANDOM_STATE,
             verbose=False,
-        ),
-    }
-    return models
-
-
-def build_regression_models() -> Dict[str, object]:
-    """Build regression models (currently only RF_REG)."""
-    models: Dict[str, object] = {}
-    if "RF_REG" in enabled_regression_models:
-        models["RF_REG"] = RandomForestRegressor(
-            n_estimators=300,
-            random_state=random_state,
-            n_jobs=-1,
         )
+
     return models
 
 
 # ---------------------------------------------------------------------------
-# CV EVALUATION HELPERS
+# CV EVALUATION
 # ---------------------------------------------------------------------------
 
 
@@ -541,43 +441,6 @@ def eval_classification_model_cv(
     }
 
 
-def eval_regression_model_cv(
-    name: str,
-    model_proto: object,
-    X_num: pd.DataFrame,
-    y: pd.Series,
-    cv: KFold,
-) -> Dict[str, float]:
-    """Cross-validate one regression model (currently RF_REG only)."""
-    rmse_scores: List[float] = []
-    mae_scores: List[float] = []
-    r2_scores: List[float] = []
-
-    for train_idx, val_idx in cv.split(X_num):
-        X_train = X_num.iloc[train_idx]
-        X_val = X_num.iloc[val_idx]
-        y_train = y.iloc[train_idx]
-        y_val = y.iloc[val_idx]
-
-        if name != "RF_REG":
-            raise ValueError(f"Unexpected regression model {name}")
-
-        model = RandomForestRegressor(**model_proto.get_params())
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_val)
-
-        mse = mean_squared_error(y_val, y_pred)
-        rmse_scores.append(float(np.sqrt(mse)))
-        mae_scores.append(mean_absolute_error(y_val, y_pred))
-        r2_scores.append(r2_score(y_val, y_pred))
-
-    return {
-        "rmse": float(np.mean(rmse_scores)),
-        "mae": float(np.mean(mae_scores)),
-        "r2": float(np.mean(r2_scores)),
-    }
-
-
 # ---------------------------------------------------------------------------
 # PER-TARGET PROCESSING
 # ---------------------------------------------------------------------------
@@ -586,21 +449,20 @@ def eval_regression_model_cv(
 def process_target(
     y_col: str,
     df: pd.DataFrame,
-    id_cols: List[str],
-    base_ft_cols: List[str],
+    ft_cols: List[str],
 ) -> Dict[str, object]:
-    """Process one target for Stage-2 training."""
+    """Process one target for Stage-2 training (classification only)."""
     logger = get_target_logger(y_col)
-    logger.info("=== Stage-2 training for %s (mode=%s) ===", y_col, TASK_MODE)
+    logger.info("=== Stage-2 training for %s ===", y_col)
 
     df_target = df[df[y_col].notna()].copy()
     n_rows = df_target.shape[0]
-    if n_rows < min_samples_per_target:
+    if n_rows < MIN_SAMPLES_PER_TARGET:
         logger.warning(
             "Skipping %s: only %d labelled rows (< %d).",
             y_col,
             n_rows,
-            min_samples_per_target,
+            MIN_SAMPLES_PER_TARGET,
         )
         return {
             "target": y_col,
@@ -609,134 +471,58 @@ def process_target(
             "n_rows": int(n_rows),
         }
 
-    y_raw = df_target[y_col]
+    y_raw = df_target[y_col].astype(str)
+    counts = y_raw.value_counts()
+    n_classes = counts.shape[0]
+    min_class = int(counts.min())
 
-    if TASK_MODE == "regression":
-        if not pd.api.types.is_numeric_dtype(y_raw):
-            logger.warning(
-                "Skipping %s: non-numeric target in regression mode.",
-                y_col,
-            )
-            return {
-                "target": y_col,
-                "skipped": True,
-                "reason": "non_numeric_target_regression",
-                "n_rows": int(n_rows),
-            }
-
-        nunique = y_raw.nunique(dropna=True)
-        if nunique <= REGRESSION_MIN_UNIQUE:
-            logger.warning(
-                (
-                    "Skipping %s: only %d unique numeric values (<= %d); "
-                    "treated as unsuitable for regression."
-                ),
-                y_col,
-                nunique,
-                REGRESSION_MIN_UNIQUE,
-            )
-            return {
-                "target": y_col,
-                "skipped": True,
-                "reason": "too_few_unique_for_regression",
-                "n_rows": int(n_rows),
-            }
-
-        y = pd.to_numeric(y_raw, errors="coerce")
-        valid_mask = y.notna()
-        df_target = df_target[valid_mask]
-        y = y[valid_mask]
-        n_rows = df_target.shape[0]
-
-        if n_rows < min_samples_per_target:
-            logger.warning(
-                "Skipping %s: only %d valid rows (< %d) after coercion.",
-                y_col,
-                n_rows,
-                min_samples_per_target,
-            )
-            return {
-                "target": y_col,
-                "skipped": True,
-                "reason": "too_few_rows_after_coerce",
-                "n_rows": int(n_rows),
-            }
-
-        logger.info(
-            "Regression target %s accepted: %d unique values, %d usable rows.",
-            y_col,
-            nunique,
-            n_rows,
-        )
-
-        cv = choose_kfold_regression(n_rows, logger)
-        if cv is None:
-            return {
-                "target": y_col,
-                "skipped": True,
-                "reason": "cv_failed",
-                "n_rows": int(n_rows),
-            }
-
-    else:
-        # Classification
-        y = y_raw.astype(str)
-        counts = y.value_counts()
-        n_classes = counts.shape[0]
-        min_class = int(counts.min())
-
-        logger.info(
-            "Classification target %s: n_classes=%d, min_class=%d, counts=%s",
-            y_col,
-            n_classes,
-            min_class,
-            counts.to_dict(),
-        )
-
-        if n_classes < 2:
-            logger.warning("Skipping %s: only one class.", y_col)
-            return {
-                "target": y_col,
-                "skipped": True,
-                "reason": "single_class",
-                "n_rows": int(n_rows),
-            }
-
-        if min_class < min_class_count_for_training:
-            logger.warning(
-                "Skipping %s: min_class=%d (< %d).",
-                y_col,
-                min_class,
-                min_class_count_for_training,
-            )
-            return {
-                "target": y_col,
-                "skipped": True,
-                "reason": "rare_class",
-                "n_rows": int(n_rows),
-            }
-
-        y_enc = pd.Series(
-            pd.factorize(y, sort=True)[0],
-            index=y.index,
-            dtype="int64",
-        )
-        y = y_enc
-
-        cv = choose_stratified_cv(y, logger)
-        if cv is None:
-            return {
-                "target": y_col,
-                "skipped": True,
-                "reason": "cv_failed",
-                "n_rows": int(n_rows),
-            }
-
-    selected_features = load_feature_importances_for_target(
-        y_col=y_col,
-        task_mode=TASK_MODE,
-        logger=logger,
+    logger.info(
+        "Target %s: n_classes=%d, min_class=%d, counts=%s",
+        y_col,
+        n_classes,
+        min_class,
+        counts.to_dict(),
     )
+
+    if n_classes < 2:
+        logger.warning("Skipping %s: only one class.", y_col)
+        return {
+            "target": y_col,
+            "skipped": True,
+            "reason": "single_class",
+            "n_rows": int(n_rows),
+        }
+
+    if min_class < MIN_CLASS_COUNT_FOR_TRAINING:
+        logger.warning(
+            "Skipping %s: min_class=%d (< %d).",
+            y_col,
+            min_class,
+            MIN_CLASS_COUNT_FOR_TRAINING,
+        )
+        return {
+            "target": y_col,
+            "skipped": True,
+            "reason": "rare_class",
+            "n_rows": int(n_rows),
+        }
+
+    y = pd.Series(
+        pd.factorize(y_raw, sort=True)[0],
+        index=y_raw.index,
+        dtype="int64",
+    )
+
+    cv = choose_stratified_cv(y, logger)
+    if cv is None:
+        return {
+            "target": y_col,
+            "skipped": True,
+            "reason": "cv_failed",
+            "n_rows": int(n_rows),
+        }
+
+    selected_features = load_feature_importances_for_target(y_col, logger)
     if not selected_features:
         return {
             "target": y_col,
@@ -745,10 +531,10 @@ def process_target(
             "n_rows": int(n_rows),
         }
 
-    all_features = [c for c in base_ft_cols if c in selected_features]
+    all_features = [c for c in ft_cols if c in selected_features]
     if not all_features:
         logger.warning(
-            "None of the selected features for %s are in base_ft_cols; skipping.",
+            "None of the selected features for %s are in ft_cols; skipping.",
             y_col,
         )
         return {
@@ -761,97 +547,28 @@ def process_target(
     X = df_target[all_features].copy()
 
     run = None
-    if use_mlflow and mlflow_available and mlflow is not None:
-        run = mlflow.start_run(run_name=f"stage2_{y_col}", nested=False)
+    if USE_MLFLOW and mlflow_available and mlflow is not None:
+        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+        run = mlflow.start_run(run_name=f"stage2_{y_col}")
         mlflow.log_param("target", y_col)
-        mlflow.log_param("task_mode", TASK_MODE)
         mlflow.log_param("n_rows", int(n_rows))
         mlflow.log_param("n_features", len(all_features))
-        mlflow.log_param("selected_features", ",".join(all_features))
+        mlflow.log_param("enabled_models", ",".join(ENABLED_MODELS))
 
-    if TASK_MODE == "regression":
-        # ---------------- Regression branch (RF_REG only) ----------------
-        X_num = prepare_view_regression(X, y)
-        models = build_regression_models()
-        if not models:
-            logger.warning(
-                "No regression models enabled in enabled_regression_models; "
-                "skipping %s.",
-                y_col,
-            )
-            return {
-                "target": y_col,
-                "skipped": True,
-                "reason": "no_regression_models",
-                "n_rows": int(n_rows),
-            }
-
-        model_metrics: Dict[str, Dict[str, float]] = {}
-        for name, proto in models.items():
-            logger.info("CV for regression model %s on %s", name, y_col)
-            metrics = eval_regression_model_cv(
-                name=name,
-                model_proto=proto,
-                X_num=X_num,
-                y=y,
-                cv=cv,
-            )
-            model_metrics[name] = metrics
-            logger.info("CV metrics for %s on %s: %s", name, y_col, metrics)
-
-        # Best by lowest RMSE (only RF_REG currently).
-        best_name = min(
-            model_metrics.items(),
-            key=lambda kv: kv[1]["rmse"],
-        )[0]
-        logger.info("Best regression model for %s is %s", y_col, best_name)
-
-        fitted_paths: Dict[str, str] = {}
-
-        # Fit RF_REG on full data.
-        proto = models["RF_REG"]
-        model = RandomForestRegressor(**proto.get_params())
-        model.fit(X_num, y)
-        out_path = models_dir / f"{y_col}_RF_REG.joblib"
-        dump(model, out_path)
-        fitted_paths["RF_REG"] = str(out_path)
-        logger.info("Saved regression model RF_REG for %s to %s", y_col, out_path)
-
-        # Best model alias (RF_REG).
-        best_src_path = fitted_paths[best_name]
-        best_model = load(best_src_path)
-        best_path = models_dir / f"{y_col}_best.joblib"
-        dump(best_model, best_path)
-        logger.info("Saved best regression model alias for %s to %s", y_col, best_path)
-
-        if use_mlflow and mlflow_available and run is not None and mlflow is not None:
-            best_metrics = model_metrics[best_name]
-            mlflow.log_metrics(best_metrics)
-            mlflow.log_param("best_model", best_name)
-            mlflow.end_run()
-
-        flat_metrics: Dict[str, float] = {}
-        for name, metrics in model_metrics.items():
-            for key, val in metrics.items():
-                flat_metrics[f"{name}_{key}"] = val
-
-        return {
-            "target": y_col,
-            "skipped": False,
-            "reason": "",
-            "n_rows": int(n_rows),
-            "task_mode": TASK_MODE,
-            "best_model": best_name,
-            **flat_metrics,
-        }
-
-    # ---------------- Classification branch ----------------
     X_num, X_cb = prepare_views_classification(X, y)
     models = build_classification_models(is_binary=y.nunique() == 2)
+    if not models:
+        logger.warning("No ENABLED_MODELS for %s; skipping.", y_col)
+        return {
+            "target": y_col,
+            "skipped": True,
+            "reason": "no_enabled_models",
+            "n_rows": int(n_rows),
+        }
 
-    model_metrics_cls: Dict[str, Dict[str, float]] = {}
+    model_metrics: Dict[str, Dict[str, float]] = {}
     for name, proto in models.items():
-        logger.info("CV for classification model %s on %s", name, y_col)
+        logger.info("CV for model %s on %s", name, y_col)
         metrics = eval_classification_model_cv(
             name=name,
             model_proto=proto,
@@ -861,16 +578,16 @@ def process_target(
             cv=cv,
             logger=logger,
         )
-        model_metrics_cls[name] = metrics
+        model_metrics[name] = metrics
         logger.info("CV metrics for %s on %s: %s", name, y_col, metrics)
 
     best_name = max(
-        model_metrics_cls.items(),
+        model_metrics.items(),
         key=lambda kv: kv[1]["f1_macro"],
     )[0]
-    logger.info("Best classification model for %s is %s", y_col, best_name)
+    logger.info("Best model for %s is %s", y_col, best_name)
 
-    fitted_paths_cls: Dict[str, str] = {}
+    fitted_paths: Dict[str, str] = {}
 
     for name, proto in models.items():
         if name == "CB":
@@ -898,36 +615,35 @@ def process_target(
         else:
             continue
 
-        out_path = models_dir / f"{y_col}_{name}.joblib"
+        out_path = MODELS_DIR / f"{y_col}_{name}.joblib"
         dump(model, out_path)
-        fitted_paths_cls[name] = str(out_path)
-        logger.info("Saved classification model %s for %s to %s", name, y_col, out_path)
+        fitted_paths[name] = str(out_path)
+        logger.info("Saved model %s for %s to %s", name, y_col, out_path)
 
-    best_src_path_cls = fitted_paths_cls[best_name]
-    best_model_cls = load(best_src_path_cls)
-    best_path_cls = models_dir / f"{y_col}_best.joblib"
-    dump(best_model_cls, best_path_cls)
-    logger.info("Saved best classification model alias for %s to %s", y_col, best_path_cls)
+    best_src_path = fitted_paths[best_name]
+    best_model = load(best_src_path)
+    best_path = MODELS_DIR / f"{y_col}_best.joblib"
+    dump(best_model, best_path)
+    logger.info("Saved best model alias for %s to %s", y_col, best_path)
 
-    if use_mlflow and mlflow_available and run is not None and mlflow is not None:
-        best_metrics_cls = model_metrics_cls[best_name]
-        mlflow.log_metrics(best_metrics_cls)
+    if USE_MLFLOW and mlflow_available and run is not None and mlflow is not None:
+        best_metrics = model_metrics[best_name]
+        mlflow.log_metrics(best_metrics)
         mlflow.log_param("best_model", best_name)
         mlflow.end_run()
 
-    flat_metrics_cls: Dict[str, float] = {}
-    for name, metrics in model_metrics_cls.items():
+    flat_metrics: Dict[str, float] = {}
+    for name, metrics in model_metrics.items():
         for key, val in metrics.items():
-            flat_metrics_cls[f"{name}_{key}"] = val
+            flat_metrics[f"{name}_{key}"] = val
 
     return {
         "target": y_col,
         "skipped": False,
         "reason": "",
         "n_rows": int(n_rows),
-        "task_mode": TASK_MODE,
         "best_model": best_name,
-        **flat_metrics_cls,
+        **flat_metrics,
     }
 
 
@@ -938,52 +654,47 @@ def process_target(
 
 def main() -> None:
     """Run Stage-2 training over all y_* targets."""
-    log.info("Loading data from %s", data_path)
-    df = pd.read_csv(data_path, low_memory=False)
+    LOG.info("Loading data from %s", DATA_PATH)
+    df = pd.read_csv(DATA_PATH, low_memory=False)
 
-    id_cols, ft_cols, y_cols = detect_columns(df)
-    log.info(
-        "Detected %d id_, %d ft_, %d y_ columns.",
-        len(id_cols),
+    _, ft_cols, y_cols = detect_columns(df)
+    LOG.info(
+        "Detected %d ft_, %d y_ columns.",
         len(ft_cols),
         len(y_cols),
     )
 
     if not ft_cols or not y_cols:
-        log.error("No ft_ or y_ columns detected; aborting.")
+        LOG.error("No ft_ or y_ columns detected; aborting.")
         return
 
-    if use_mlflow and mlflow_available and mlflow is not None:
-        mlflow.set_experiment(mlflow_experiment_name)
-
-    log.info(
-        "Starting Stage-2 over %d targets with n_jobs_targets=%d (mode=%s).",
+    LOG.info(
+        "Starting Stage-2 over %d targets with n_jobs_targets=%d.",
         len(y_cols),
-        n_jobs_targets,
-        TASK_MODE,
+        N_JOBS_TARGETS,
     )
 
-    results = Parallel(n_jobs=n_jobs_targets)(
-        delayed(process_target)(y_col, df, id_cols, ft_cols) for y_col in y_cols
+    results = Parallel(n_jobs=N_JOBS_TARGETS)(
+        delayed(process_target)(y_col, df, ft_cols) for y_col in y_cols
     )
 
     skipped = [r for r in results if r.get("skipped")]
     processed = [r for r in results if not r.get("skipped")]
 
     if skipped:
-        pd.DataFrame(skipped).to_csv(skipped_targets_csv, index=False)
-        log.info("Saved skipped targets summary to %s", skipped_targets_csv)
+        pd.DataFrame(skipped).to_csv(SKIPPED_TARGETS_CSV, index=False)
+        LOG.info("Saved skipped targets summary to %s", SKIPPED_TARGETS_CSV)
 
     if processed:
         df_cv = pd.DataFrame(processed)
-        df_cv.to_csv(cv_results_csv, index=False)
-        with cv_results_json.open("w", encoding="utf-8") as f:
+        df_cv.to_csv(CV_RESULTS_CSV, index=False)
+        with CV_RESULTS_JSON.open("w", encoding="utf-8") as f:
             json.dump(processed, f, indent=2)
-        log.info("Saved CV results to %s and %s", cv_results_csv, cv_results_json)
+        LOG.info("Saved CV results to %s and %s", CV_RESULTS_CSV, CV_RESULTS_JSON)
     else:
-        log.warning("No targets were successfully processed in Stage-2.")
+        LOG.warning("No targets were successfully processed in Stage-2.")
 
-    log.info(
+    LOG.info(
         "Stage-2 completed: %d processed, %d skipped.",
         len(processed),
         len(skipped),
