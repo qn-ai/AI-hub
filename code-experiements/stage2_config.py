@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,9 +21,7 @@ class Stage2Config:
     # -----------------------------
     # TARGET SELECTION
     # -----------------------------
-    # If set, run ONLY these targets (exact names). Order is preserved.
-    TARGETS_INCLUDE: Optional[List[str]] = None
-    # Always skip these targets (exact names).
+    TARGETS_INCLUDE: Optional[List[str]] = None  # exact names, order preserved
     TARGETS_EXCLUDE: List[str] = field(default_factory=list)
 
     # -----------------------------
@@ -48,6 +48,9 @@ class Stage2Config:
 
     # Only use if you *must*
     NUM_IMPUTE: str | None = None  # "median" or None
+
+    # small sample size for “label sanity check” saved into results
+    LABEL_EXAMPLE_N: int = 50
 
     # -----------------------------
     # PARALLELISM
@@ -118,7 +121,6 @@ class Stage2Config:
             exclude = set(self.TARGETS_EXCLUDE)
             out = [y for y in out if y not in exclude]
 
-        # preserve include order if provided
         if self.TARGETS_INCLUDE is not None:
             return [y for y in self.TARGETS_INCLUDE if y in out]
 
