@@ -46,11 +46,11 @@ class Stage2Config:
     USE_CATBOOST_ENCODER: bool = True
     CAT_FILL_VALUE: str = "NA_CAT"
 
-    # Only use if you *must*
+    # only set if you must
     NUM_IMPUTE: str | None = None  # "median" or None
 
-    # small sample size for “label sanity check” saved into results
-    LABEL_EXAMPLE_N: int = 50
+    # decoded label sanity-check sample size stored in results
+    LABEL_EXAMPLE_N: int = 100
 
     # -----------------------------
     # PARALLELISM
@@ -82,12 +82,16 @@ class Stage2Config:
     def N_JOBS_TARGETS(self) -> int:
         return max(min(self.CPU_COUNT - 1, self.MAX_TARGET_JOBS), 2)
 
+    # -----------------------------
+    # PATHS (Stage-2 outputs)
+    # -----------------------------
     @property
     def BASE_DIR(self) -> Path:
         return Path(f"ae_models_pipeline/{self.MODEL_TYPE}")
 
     @property
     def FEATURE_IMPORTANCE_DIR(self) -> Path:
+        # Stage-1 output folder that Stage-2 consumes
         return self.BASE_DIR / "feature_importances"
 
     @property
@@ -114,12 +118,12 @@ class Stage2Config:
         out = list(y_cols)
 
         if self.TARGETS_INCLUDE is not None:
-            include = set(self.TARGETS_INCLUDE)
-            out = [y for y in out if y in include]
+            inc = set(self.TARGETS_INCLUDE)
+            out = [y for y in out if y in inc]
 
         if self.TARGETS_EXCLUDE:
-            exclude = set(self.TARGETS_EXCLUDE)
-            out = [y for y in out if y not in exclude]
+            exc = set(self.TARGETS_EXCLUDE)
+            out = [y for y in out if y not in exc]
 
         if self.TARGETS_INCLUDE is not None:
             return [y for y in self.TARGETS_INCLUDE if y in out]
