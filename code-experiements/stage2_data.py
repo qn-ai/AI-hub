@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from category_encoders import CatBoostEncoder
@@ -11,9 +12,6 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from .stage2_config import Stage2Config
 
 
-# -----------------------------
-# LOGGING
-# -----------------------------
 def init_root_logger() -> logging.Logger:
     logging.basicConfig(
         level=logging.INFO,
@@ -41,14 +39,10 @@ def get_target_logger(cfg: Stage2Config, y_col: str) -> logging.Logger:
     return logger
 
 
-# -----------------------------
-# COLUMNS
-# -----------------------------
 def detect_columns(df: pd.DataFrame, cfg: Stage2Config) -> Tuple[List[str], List[str], List[str]]:
     if cfg.MODEL_TYPE == "predictassessment":
         id_cols = [c for c in df.columns if c.startswith(cfg.ID_PREFIX)]
         ft_cols = [c for c in df.columns if c.startswith(cfg.FEATURE_PREFIX)]
-        # Default detected list; you can override via cfg.TARGETS_INCLUDE
         y_cols = [c for c in df.columns if c.startswith(cfg.TARGET_PREFIX)]
         return id_cols, ft_cols, y_cols
 
@@ -66,9 +60,6 @@ def detect_columns(df: pd.DataFrame, cfg: Stage2Config) -> Tuple[List[str], List
     raise ValueError(f"Invalid MODEL_TYPE={cfg.MODEL_TYPE}")
 
 
-# -----------------------------
-# FEATURE SELECTION
-# -----------------------------
 def load_feature_importances_for_target(
     y_col: str,
     cfg: Stage2Config,
@@ -98,9 +89,6 @@ def load_feature_importances_for_target(
     return selected
 
 
-# -----------------------------
-# TARGET CLEANING (mixed values fix)
-# -----------------------------
 def clean_target_and_filter_rows(
     df: pd.DataFrame,
     y_col: str,
@@ -115,7 +103,6 @@ def clean_target_and_filter_rows(
         y = y.loc[good]
         return df_target, y
 
-    # classification: stable string labels
     y = df_target[y_col].astype("string").str.strip()
     y = y.replace("", pd.NA)
     good = y.notna()
@@ -124,9 +111,36 @@ def clean_target_and_filter_rows(
     return df_target, y
 
 
-# -----------------------------
-# FEATURE VIEWS (mixed feature dtypes fix)
-# -----------------------------
+def encode_class_labels(y: pd.Series) -> Tuple[pd.Series, Dict[int, str]]:
+    """
+    Encode string class labels into stable int codes 0..K-1.
+    Sorting prefers leading numeric prefixes like '0. Never' -> by 0,1,2...
+    """
+    y_str = y.astype("string").str.strip()
+    y_str = y_str.replace("", pd.NA)
+    y_str = y_str[y_str.notna()]
+
+    def sort_key(label: str) -> tuple[int, str]:
+        m = re.match(r"^\s*(\d+)\s*[\.\)]\s*(.*)$", str(label))
+        if m:
+            return (int(m.group(1)), str(label))
+        return (10**9, str(label))
+
+    classes = sorted(y_str.unique().tolist(), key=sort_key)
+    cat = pd.Categorical(y_str, categories=classes, ordered=True)
+
+    y_enc = pd.Series(cat.codes, index=y_str.index, dtype="int64")
+    if (y_enc < 0).any():
+        raise ValueError("Found unknown labels during encoding (code = -1).")
+
+    label_map = {i: cls for i, cls in enumerate(classes)}
+    return y_enc, label_map
+
+
+def decode_labels(y_pred_codes, label_map: Dict[int, str]) -> List[str]:
+    return [label_map.get(int(c), f"UNKNOWN_{c}") for c in list(y_pred_codes)]
+
+
 def _coerce_object_cols_to_string(X: pd.DataFrame) -> pd.DataFrame:
     X2 = X.copy()
     obj_cols = X2.select_dtypes(include=["object"]).columns.tolist()
@@ -140,13 +154,11 @@ def prepare_views(
     y: pd.Series,
     cfg: Stage2Config,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # CatBoost view: keep string categoricals
     X_cb = _coerce_object_cols_to_string(X)
     cb_cat_cols = X_cb.select_dtypes(include=["string"]).columns.tolist()
     for c in cb_cat_cols:
         X_cb[c] = X_cb[c].fillna(cfg.CAT_FILL_VALUE)
 
-    # Numeric view: encode categoricals then coerce to numeric
     X_num = _coerce_object_cols_to_string(X)
     cat_cols = X_num.select_dtypes(include=["string"]).columns.tolist()
 
@@ -165,9 +177,6 @@ def prepare_views(
     return X_num, X_cb
 
 
-# -----------------------------
-# CV chooser
-# -----------------------------
 def choose_cv(y: pd.Series, cfg: Stage2Config, logger: logging.Logger):
     if cfg.TASK_MODE == "regression":
         return KFold(
