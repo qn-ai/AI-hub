@@ -33,6 +33,10 @@ from .stage2_data import (
     detect_columns,
     load_feature_importances_for_target,
     clean_target_and_filter_rows,
+    encode_class_labels,
+    decode_labels,
+    save_label_map,
+    label_map_compact_json,
     prepare_views,
     choose_cv,
 )
@@ -47,9 +51,6 @@ except Exception:
     MLFLOW_AVAILABLE = False
 
 
-# -----------------------------
-# MODEL BUILDERS (fine-tune params here)
-# -----------------------------
 def build_classification_models(is_binary: bool, cfg: Stage2Config) -> Dict[str, object]:
     if is_binary:
         lgbm_obj = "binary"
@@ -114,9 +115,6 @@ def build_regression_models(cfg: Stage2Config) -> Dict[str, object]:
     return models
 
 
-# -----------------------------
-# CV EVALUATION
-# -----------------------------
 def eval_classification_model_cv(
     name: str,
     model_proto: object,
@@ -143,7 +141,6 @@ def eval_classification_model_cv(
         if name == "CB":
             cb_cat_cols = X_cb.select_dtypes(include=["string"]).columns.tolist()
             cat_idx = [X_cb.columns.get_loc(c) for c in cb_cat_cols]
-
             model = CatBoostClassifier(**model_proto.get_params())
             model.fit(Xtr_cb, ytr, cat_features=cat_idx if cat_idx else None, verbose=False)
             pred = model.predict(Xva_cb)
@@ -229,26 +226,56 @@ def eval_regression_model_cv(model_proto: object, X_num: pd.DataFrame, y: pd.Ser
     }
 
 
-# -----------------------------
-# PER TARGET
-# -----------------------------
+def _predict_best_model_sample_labels(
+    best_name: str,
+    best_model,
+    X_num: pd.DataFrame,
+    X_cb: pd.DataFrame,
+    label_map: Dict[int, str],
+    n: int,
+) -> str:
+    n = min(n, len(X_num))
+    if n <= 0:
+        return ""
+
+    if best_name == "CB":
+        preds = best_model.predict(X_cb.head(n))
+    else:
+        preds = best_model.predict(X_num.head(n))
+
+    decoded = decode_labels(preds, label_map)
+    counts = pd.Series(decoded).value_counts().head(10).to_dict()
+    return json.dumps(counts, ensure_ascii=False)
+
+
 def process_target(y_col: str, df: pd.DataFrame, ft_cols: List[str], cfg: Stage2Config) -> Dict[str, object]:
     logger = get_target_logger(cfg, y_col)
     logger.info("=== Stage-2 training for %s ===", y_col)
 
-    df_target, y = clean_target_and_filter_rows(df, y_col, cfg)
+    df_target, y_raw = clean_target_and_filter_rows(df, y_col, cfg)
     n_rows = int(len(df_target))
 
     if n_rows < cfg.MIN_SAMPLES_PER_TARGET:
-        logger.warning("Skipping %s: too few rows (%d).", y_col, n_rows)
         return {"target": y_col, "skipped": True, "reason": "too_few_rows", "n_rows": n_rows}
 
+    label_map = None
+    label_map_path = ""
+    label_map_json = ""
+
     if cfg.TASK_MODE == "classification":
+        # FIX: always encode to integer codes for all models
+        y, label_map = encode_class_labels(y_raw)
         counts = y.value_counts()
         if counts.shape[0] < 2:
             return {"target": y_col, "skipped": True, "reason": "single_class", "n_rows": n_rows}
         if int(counts.min()) < cfg.MIN_CLASS_COUNT_FOR_TRAINING:
             return {"target": y_col, "skipped": True, "reason": "rare_class", "n_rows": n_rows}
+
+        label_map_path = save_label_map(cfg, y_col, label_map)
+        label_map_json = label_map_compact_json(label_map)
+        logger.info("Saved label map to %s", label_map_path)
+    else:
+        y = y_raw  # regression numeric series already cleaned
 
     cv = choose_cv(y, cfg, logger)
     if cv is None:
@@ -269,7 +296,6 @@ def process_target(y_col: str, df: pd.DataFrame, ft_cols: List[str], cfg: Stage2
         is_binary=(y.nunique() == 2),
         cfg=cfg,
     )
-
     if not models:
         return {"target": y_col, "skipped": True, "reason": "no_enabled_models", "n_rows": n_rows}
 
@@ -282,6 +308,7 @@ def process_target(y_col: str, df: pd.DataFrame, ft_cols: List[str], cfg: Stage2
         mlflow.log_param("n_features", len(use_features))
         mlflow.log_param("enabled_models", ",".join(cfg.ENABLED_MODELS))
 
+    # CV
     model_metrics: Dict[str, Dict[str, float]] = {}
     for name, proto in models.items():
         logger.info("CV for model %s", name)
@@ -296,6 +323,7 @@ def process_target(y_col: str, df: pd.DataFrame, ft_cols: List[str], cfg: Stage2
     best_name = max(model_metrics.items(), key=lambda kv: kv[1][metric_best])[0]
     logger.info("Best model for %s is %s", y_col, best_name)
 
+    # Fit all + save
     cfg.TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
     fitted_paths: Dict[str, str] = {}
 
@@ -317,6 +345,17 @@ def process_target(y_col: str, df: pd.DataFrame, ft_cols: List[str], cfg: Stage2
     best_path = cfg.TRAINED_MODELS_DIR / f"{y_col}_best.joblib"
     dump(best_model, best_path)
 
+    best_pred_label_counts_sample = ""
+    if cfg.TASK_MODE == "classification" and label_map is not None:
+        best_pred_label_counts_sample = _predict_best_model_sample_labels(
+            best_name=best_name,
+            best_model=best_model,
+            X_num=X_num,
+            X_cb=X_cb,
+            label_map=label_map,
+            n=cfg.LABEL_EXAMPLE_N,
+        )
+
     if cfg.USE_MLFLOW and MLFLOW_AVAILABLE and run is not None and mlflow is not None:
         mlflow.log_metrics(model_metrics[best_name])
         mlflow.log_param("best_model", best_name)
@@ -327,19 +366,29 @@ def process_target(y_col: str, df: pd.DataFrame, ft_cols: List[str], cfg: Stage2
         for k, v in mm.items():
             flat[f"{mname}_{k}"] = float(v)
 
-    return {
+    out = {
         "target": y_col,
         "skipped": False,
         "reason": "",
         "n_rows": n_rows,
         "best_model": best_name,
+        "best_model_path": str(best_path),
         **flat,
     }
 
+    # add mapping info into results
+    if cfg.TASK_MODE == "classification":
+        out.update(
+            {
+                "label_map_path": label_map_path,
+                "label_map_json": label_map_json,
+                "best_pred_label_counts_sample": best_pred_label_counts_sample,
+            }
+        )
 
-# -----------------------------
-# MAIN
-# -----------------------------
+    return out
+
+
 def main() -> None:
     cfg = Stage2Config()
 
@@ -387,7 +436,7 @@ def main() -> None:
         df_cv = pd.DataFrame(processed)
         df_cv.to_csv(cfg.CV_RESULTS_CSV, index=False)
         with cfg.CV_RESULTS_JSON.open("w", encoding="utf-8") as f:
-            json.dump(processed, f, indent=2)
+            json.dump(processed, f, indent=2, ensure_ascii=False)
         LOG.info("Saved CV results to %s and %s", cfg.CV_RESULTS_CSV, cfg.CV_RESULTS_JSON)
 
     LOG.info("Stage-2 completed: %d processed, %d skipped", len(processed), len(skipped))
