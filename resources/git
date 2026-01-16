@@ -1,4 +1,0 @@
-Create the branch: git checkout -b feat/text-chunking-config
-Add files: git add config_class.py test_config_class.py
-Commit: git commit -m "feat: add TextChunking config class and corresponding pytest tests"
-Push: git push -u origin feat/text-chunking-config
