@@ -1,3 +1,16 @@
+def predict_proba_gt_from_boosters(boosters, X):
+    # returns (n_samples, K-1)
+    return np.vstack([b.predict(X, num_iteration=b.best_iteration) for b in boosters]).T
+
+def decode_coral(proba_gt, threshold):
+    return (proba_gt >= threshold).sum(axis=1).astype(int)
+
+def predict_coral_from_boosters(boosters, X, threshold):
+    proba_gt = predict_proba_gt_from_boosters(boosters, X)
+    return decode_coral(proba_gt, threshold)
+
+
+
 # config.py
 
 TRAIN_CSV = "training_data.csv"
