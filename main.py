@@ -1,13 +1,170 @@
-def predict_proba_gt_from_boosters(boosters, X):
-    # returns (n_samples, K-1)
-    return np.vstack([b.predict(X, num_iteration=b.best_iteration) for b in boosters]).T
 
-def decode_coral(proba_gt, threshold):
-    return (proba_gt >= threshold).sum(axis=1).astype(int)
 
-def predict_coral_from_boosters(boosters, X, threshold):
-    proba_gt = predict_proba_gt_from_boosters(boosters, X)
-    return decode_coral(proba_gt, threshold)
+import pandas as pd
+import numpy as np
+
+def fix_bad_dtypes_for_features(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    onehot_low_card: bool = False,
+    low_card_max_unique: int = 20,
+    high_card_drop_threshold: int = 200,
+    report_top: int = 10,
+):
+    """
+    Fix 'object' columns inside feature_cols:
+      - If numeric-like: coerce to numeric
+      - Else:
+          - optional: one-hot if low-cardinality
+          - otherwise: drop (safe)
+    Returns:
+      df_fixed, new_feature_cols, report_dict
+    """
+    df = df.copy()
+
+    # Identify object feature columns
+    obj_cols = [c for c in feature_cols if c in df.columns and df[c].dtype == "object"]
+
+    def numeric_like_ratio(s: pd.Series, sample_size: int = 2000) -> float:
+        x = s.dropna().astype(str).head(sample_size)
+
+        if len(x) == 0:
+            return 0.0
+
+        # remove commas and spaces
+        x = x.str.replace(",", "", regex=False).str.strip()
+
+        # numeric pattern: int or float with optional leading sign
+        return float(x.str.match(r"^-?\d+(\.\d+)?$", na=False).mean())
+
+    numeric_like = []
+    non_numeric = []
+
+    for c in obj_cols:
+        r = numeric_like_ratio(df[c])
+        if r >= 0.80:
+            numeric_like.append(c)
+        else:
+            non_numeric.append(c)
+
+    # 1) Coerce numeric-like strings -> numeric
+    for c in numeric_like:
+        df[c] = (
+            df[c].astype(str)
+                 .str.replace(",", "", regex=False)
+                 .str.strip()
+        )
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # 2) Handle non-numeric object columns
+    low_card = []
+    high_card = []
+
+    for c in non_numeric:
+        nunq = df[c].nunique(dropna=True)
+        if nunq <= low_card_max_unique:
+            low_card.append(c)
+        else:
+            high_card.append(c)
+
+    # Safe default: drop high-cardinality text/IDs
+    drop_cols = list(high_card)
+
+    # Optional: one-hot low-card categoricals
+    if onehot_low_card and len(low_card) > 0:
+        df = pd.get_dummies(df, columns=low_card, dummy_na=True)
+        # feature cols update: remove original low-card col; add dummy cols
+        new_feature_cols = []
+        for c in feature_cols:
+            if c in low_card:
+                # replaced by dummy columns that start with c + "_"
+                dummies = [dc for dc in df.columns if dc.startswith(c + "_")]
+                new_feature_cols.extend(dummies)
+            elif c in drop_cols:
+                continue
+            else:
+                new_feature_cols.append(c)
+    else:
+        # drop all remaining non-numeric object cols (both low + high)
+        drop_cols = drop_cols + low_card
+        new_feature_cols = [c for c in feature_cols if c not in drop_cols]
+
+    # Drop chosen columns if they exist
+    drop_cols = [c for c in drop_cols if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    # 3) Final safety: force remaining features to numeric if possible
+    # (anything still object is removed)
+    still_obj = [c for c in new_feature_cols if c in df.columns and df[c].dtype == "object"]
+    if still_obj:
+        # Try coercion, then drop if still bad
+        for c in still_obj:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        still_obj2 = [c for c in new_feature_cols if c in df.columns and df[c].dtype == "object"]
+        if still_obj2:
+            df = df.drop(columns=still_obj2)
+            new_feature_cols = [c for c in new_feature_cols if c not in still_obj2]
+
+    # 4) Replace inf and fill NaN (LightGBM-friendly)
+    df[new_feature_cols] = df[new_feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # Report
+    rep = {
+        "object_feature_cols": obj_cols,
+        "numeric_like_converted": numeric_like,
+        "non_numeric_object_cols": non_numeric,
+        "low_card_categoricals": low_card,
+        "high_card_text_or_ids": high_card,
+        "dropped_cols": drop_cols,
+        "still_object_after_fix": [c for c in new_feature_cols if df[c].dtype == "object"],
+    }
+
+    # Quick print summary
+    print("\n[dtype-fix] object features:", len(obj_cols))
+    print("[dtype-fix] numeric-like converted:", len(numeric_like))
+    print("[dtype-fix] non-numeric:", len(non_numeric))
+    print("[dtype-fix] dropped:", len(drop_cols))
+    if rep["still_object_after_fix"]:
+        print("[dtype-fix] WARNING: still object after fix:", rep["still_object_after_fix"][:report_top])
+
+    return df, new_feature_cols, rep
+
+
+# df already loaded
+# feature_cols already defined
+
+df, feature_cols, dtype_report = fix_bad_dtypes_for_features(
+    df,
+    feature_cols,
+    onehot_low_card=False,          # safest default (drop non-numeric)
+    low_card_max_unique=20,
+    high_card_drop_threshold=200,
+)
+
+# now build X using the cleaned df and updated feature_cols
+X = df[feature_cols]
+
+
+stage0_art = joblib.load(config.STAGE0_PATH)
+feature_cols = stage0_art["selected_features"]
+
+df_unseen = pd.read_csv(config.UNSEEN_CSV)
+
+# Make sure unseen has the required columns (missing -> 0)
+for c in feature_cols:
+    if c not in df_unseen.columns:
+        df_unseen[c] = 0.0
+
+df_unseen, feature_cols, dtype_report = fix_bad_dtypes_for_features(
+    df_unseen,
+    feature_cols,
+    onehot_low_card=False,
+)
+
+X_unseen = df_unseen[feature_cols]
+
 
 
 
