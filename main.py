@@ -1,193 +1,153 @@
-# stage0_feature_filter.py
-from __future__ import annotations
-import os
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Any, Tuple
-import numpy as np
-import pandas as pd
-import joblib
-import lightgbm as lgb
+# config.py
 
-@dataclass
-class Stage0Config:
-    missing_threshold: float = 0.80
-    corr_threshold: float = 0.95
-    corr_method: str = "spearman"
-    max_corr_features: Optional[int] = 400
-    importance_num_boost_round: int = 300
-    importance_early_stopping: int = 50
-    random_state: int = 42
+TRAIN_CSV = "training_data.csv"
+UNSEEN_CSV = "unseen_data.csv"
 
-@dataclass
-class Stage0Artifacts:
-    selected_features: List[str]
-    dropped_missing: List[str]
-    dropped_corr: List[str]
-    corr_pairs_dropped: List[Tuple[str, str, float]]
-    feature_importance_gain: Dict[str, float]
-    config: Dict[str, Any]
+TARGETS = ["y_target1", "y_target2", "y_target3"]   # <-- EDIT
+ID_COL = "record_id"  # optional (set None if not present)
 
-class Stage0FeatureFilter:
-    def __init__(self, config: Stage0Config = Stage0Config()):
-        self.config = config
-        self.artifacts: Optional[Stage0Artifacts] = None
+ARTIFACTS_DIR = "artifacts"
+STAGE0_PATH = f"{ARTIFACTS_DIR}/stage0_features.joblib"
+STAGE0_REPORT_DIR = f"{ARTIFACTS_DIR}/stage0_reports"
+MODELS_DIR = f"{ARTIFACTS_DIR}/coral_models"
 
-    def fit(self, X_train: pd.DataFrame, y_train, X_valid=None, y_valid=None) -> "Stage0FeatureFilter":
-        X_train = self._ensure_df(X_train)
-        y_train = np.asarray(y_train)
+UNSEEN_REPORT_DIR = "unseen_reports"
+COMBINED_PDF_NAME = "business_report_unseen.pdf"
 
-        kept, dropped_missing = self._drop_high_missing(X_train)
-        X_tr = X_train[kept]
+# Stage-0 settings
+MISSING_THRESHOLD = 0.80
+CORR_THRESHOLD = 0.95
+MAX_CORR_FEATURES = 400
 
-        gain_imp = self._quick_lgbm_importance(X_tr, y_train)
+# Threshold decode tuning
+DECODE_GRID = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+ALPHA = 0.7  # MAE vs distribution realism (0.7 is a good business-safe default)
 
-        pool = kept
-        if self.config.max_corr_features is not None and len(pool) > self.config.max_corr_features:
-            pool = sorted(pool, key=lambda f: gain_imp.get(f, 0.0), reverse=True)[: self.config.max_corr_features]
+# Weight tuning grid
+WEIGHT_GRID = [
+    {"power": 0.4, "cap": 10.0, "gamma": 0.2},
+    {"power": 0.5, "cap": 10.0, "gamma": 0.2},
+    {"power": 0.5, "cap": 12.0, "gamma": 0.3},  # default-ish
+    {"power": 0.6, "cap": 12.0, "gamma": 0.3},
+    {"power": 0.5, "cap": 15.0, "gamma": 0.4},
+]
 
-        kept_final, dropped_corr, pairs = self._correlation_prune(X_tr[pool], kept, gain_imp)
-
-        self.artifacts = Stage0Artifacts(
-            selected_features=kept_final,
-            dropped_missing=dropped_missing,
-            dropped_corr=dropped_corr,
-            corr_pairs_dropped=pairs,
-            feature_importance_gain=gain_imp,
-            config=asdict(self.config),
-        )
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        self._check_fitted()
-        X = self._ensure_df(X)
-
-        missing_cols = [c for c in self.artifacts.selected_features if c not in X.columns]
-        if missing_cols:
-            X = X.copy()
-            for c in missing_cols:
-                X[c] = 0.0
-
-        return X[self.artifacts.selected_features]
-
-    def save(self, path: str) -> None:
-        self._check_fitted()
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        joblib.dump({"artifacts": self.artifacts}, path)
-
-    @classmethod
-    def load(cls, path: str) -> "Stage0FeatureFilter":
-        payload = joblib.load(path)
-        obj = cls(config=Stage0Config(**payload["artifacts"].config))
-        obj.artifacts = payload["artifacts"]
-        return obj
-
-    def export_report(self, out_dir: str, prefix: str = "stage0") -> None:
-        self._check_fitted()
-        os.makedirs(out_dir, exist_ok=True)
-
-        pd.Series(self.artifacts.selected_features, name="feature").to_csv(
-            os.path.join(out_dir, f"{prefix}_selected_features.csv"), index=False
-        )
-        pd.Series(self.artifacts.dropped_missing, name="feature").to_csv(
-            os.path.join(out_dir, f"{prefix}_dropped_missing.csv"), index=False
-        )
-        pd.Series(self.artifacts.dropped_corr, name="feature").to_csv(
-            os.path.join(out_dir, f"{prefix}_dropped_corr.csv"), index=False
-        )
-        pd.DataFrame(self.artifacts.corr_pairs_dropped, columns=["kept", "dropped", "abs_corr"]).to_csv(
-            os.path.join(out_dir, f"{prefix}_corr_pairs_dropped.csv"), index=False
-        )
-        (pd.Series(self.artifacts.feature_importance_gain, name="gain_importance")
-           .sort_values(ascending=False)
-           .reset_index()
-           .rename(columns={"index": "feature"})
-           .to_csv(os.path.join(out_dir, f"{prefix}_feature_importance_gain.csv"), index=False))
-
-    @staticmethod
-    def _ensure_df(X) -> pd.DataFrame:
-        return X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
-
-    def _check_fitted(self):
-        if self.artifacts is None:
-            raise RuntimeError("Stage0FeatureFilter not fitted. Call fit() first.")
-
-    def _drop_high_missing(self, X: pd.DataFrame):
-        miss_rate = X.isna().mean(axis=0)
-        dropped = miss_rate[miss_rate >= self.config.missing_threshold].index.tolist()
-        kept = [c for c in X.columns if c not in set(dropped)]
-        return kept, dropped
-
-    def _quick_lgbm_importance(self, X_train: pd.DataFrame, y_train: np.ndarray):
-        X_tr = X_train.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        y_tr = y_train
-
-        uniq = np.unique(y_tr[~pd.isna(y_tr)])
-        is_binary = len(uniq) <= 2
-
-        if is_binary:
-            params = {"objective":"binary","metric":"binary_logloss","learning_rate":0.05,
-                      "num_leaves":63,"min_data_in_leaf":50,"feature_fraction":0.8,
-                      "bagging_fraction":0.8,"bagging_freq":1,"lambda_l2":1.0,
-                      "verbosity":-1,"seed":self.config.random_state}
-        else:
-            n_classes = int(np.max(uniq) + 1)
-            params = {"objective":"multiclass","num_class":n_classes,"metric":"multi_logloss",
-                      "learning_rate":0.05,"num_leaves":63,"min_data_in_leaf":50,
-                      "feature_fraction":0.8,"bagging_fraction":0.8,"bagging_freq":1,
-                      "lambda_l2":1.0,"verbosity":-1,"seed":self.config.random_state}
-
-        dtrain = lgb.Dataset(X_tr, label=y_tr, free_raw_data=False)
-        booster = lgb.train(params=params, train_set=dtrain, num_boost_round=self.config.importance_num_boost_round)
-
-        gain = booster.feature_importance(importance_type="gain")
-        feats = booster.feature_name()
-        imp = {f: float(g) for f, g in zip(feats, gain)}
-        for f in X_train.columns:
-            imp.setdefault(f, 0.0)
-        return imp
-
-    def _correlation_prune(self, X_pool: pd.DataFrame, all_features: List[str], gain_importance: Dict[str, float]):
-        Xc = X_pool.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        corr = Xc.corr(method=self.config.corr_method).abs()
-        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-
-        to_drop = set()
-        pairs = []
-
-        cols_sorted = sorted(list(upper.columns), key=lambda f: gain_importance.get(f, 0.0), reverse=True)
-        for col in cols_sorted:
-            if col in to_drop:
-                continue
-            high = upper[col][upper[col] >= self.config.corr_threshold].dropna()
-            for other, val in high.items():
-                if other in to_drop:
-                    continue
-                if gain_importance.get(col, 0.0) >= gain_importance.get(other, 0.0):
-                    kept, dropped = col, other
-                else:
-                    kept, dropped = other, col
-                to_drop.add(dropped)
-                pairs.append((kept, dropped, float(val)))
-
-        dropped_corr = sorted(list(to_drop))
-        kept_final = [f for f in all_features if f not in to_drop]
-        return kept_final, dropped_corr, pairs
+# LightGBM base params
+LGB_BASE_PARAMS = {
+    "learning_rate": 0.05,
+    "num_leaves": 63,
+    "min_data_in_leaf": 30,
+    "feature_fraction": 0.9,
+    "bagging_fraction": 0.9,
+    "bagging_freq": 1,
+    "lambda_l2": 1.0,
+    "seed": 42,
+}
 
 
-### Stage 2
 # coral_train.py
-import os
+import os, json
 import numpy as np
 import pandas as pd
 import joblib
 import lightgbm as lgb
-from dataclasses import dataclass
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 
-from stage0_feature_filter import Stage0FeatureFilter, Stage0Config
+import config
 
 
+# =============================
+# Stage-0: feature filter (embedded)
+# =============================
+def stage0_fit_transform(X_tr: pd.DataFrame, y_tr_for_importance: np.ndarray):
+    # 1) drop high-missing
+    miss_rate = X_tr.isna().mean(axis=0)
+    dropped_missing = miss_rate[miss_rate >= config.MISSING_THRESHOLD].index.tolist()
+    kept = [c for c in X_tr.columns if c not in set(dropped_missing)]
+    X_tr1 = X_tr[kept]
+
+    # 2) quick LGBM importance (cheap)
+    X_imp = X_tr1.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    y_imp = np.asarray(y_tr_for_importance).astype(int)
+
+    params = {
+        "objective": "multiclass" if len(np.unique(y_imp)) > 2 else "binary",
+        "metric": "multi_logloss" if len(np.unique(y_imp)) > 2 else "binary_logloss",
+        "verbosity": -1,
+        "learning_rate": 0.05,
+        "num_leaves": 63,
+        "min_data_in_leaf": 50,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "lambda_l2": 1.0,
+        "seed": 42,
+    }
+    if params["objective"] == "multiclass":
+        params["num_class"] = int(np.max(y_imp) + 1)
+
+    booster = lgb.train(
+        params=params,
+        train_set=lgb.Dataset(X_imp, label=y_imp, free_raw_data=False),
+        num_boost_round=300,
+    )
+    gain = booster.feature_importance(importance_type="gain")
+    feats = booster.feature_name()
+    imp = {f: float(g) for f, g in zip(feats, gain)}
+    for f in X_tr1.columns:
+        imp.setdefault(f, 0.0)
+
+    # 3) correlation prune (spearman abs >= threshold), keep higher-importance
+    pool = kept
+    if config.MAX_CORR_FEATURES is not None and len(pool) > config.MAX_CORR_FEATURES:
+        pool = sorted(pool, key=lambda f: imp.get(f, 0.0), reverse=True)[: config.MAX_CORR_FEATURES]
+
+    Xc = X_tr1[pool].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    corr = Xc.corr(method="spearman").abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+
+    to_drop = set()
+    corr_pairs = []
+    cols_sorted = sorted(list(upper.columns), key=lambda f: imp.get(f, 0.0), reverse=True)
+
+    for col in cols_sorted:
+        if col in to_drop:
+            continue
+        high = upper[col][upper[col] >= config.CORR_THRESHOLD].dropna()
+        for other, val in high.items():
+            if other in to_drop:
+                continue
+            # drop lower-importance one
+            if imp.get(col, 0.0) >= imp.get(other, 0.0):
+                kept_f, drop_f = col, other
+            else:
+                kept_f, drop_f = other, col
+            to_drop.add(drop_f)
+            corr_pairs.append((kept_f, drop_f, float(val)))
+
+    dropped_corr = sorted(list(to_drop))
+    selected_features = [f for f in kept if f not in to_drop]
+
+    artifacts = {
+        "selected_features": selected_features,
+        "dropped_missing": dropped_missing,
+        "dropped_corr": dropped_corr,
+        "corr_pairs_dropped": corr_pairs,
+        "feature_importance_gain": imp,
+        "config": {
+            "missing_threshold": config.MISSING_THRESHOLD,
+            "corr_threshold": config.CORR_THRESHOLD,
+            "max_corr_features": config.MAX_CORR_FEATURES,
+        },
+    }
+    return artifacts
+
+
+# =============================
+# CORAL core + improved weights
+# =============================
 def make_coral_targets(y: np.ndarray, K: int) -> np.ndarray:
     y = np.asarray(y).astype(int)
     thr = np.arange(K - 1)
@@ -196,10 +156,25 @@ def make_coral_targets(y: np.ndarray, K: int) -> np.ndarray:
 def decode_coral(proba_gt: np.ndarray, t: float) -> np.ndarray:
     return (proba_gt >= t).sum(axis=1).astype(int)
 
-@dataclass
+def dist_pct(y: np.ndarray, K: int) -> np.ndarray:
+    y = np.asarray(y).astype(int)
+    c = np.bincount(y, minlength=K).astype(float)
+    s = c.sum()
+    return c / s if s > 0 else np.zeros(K)
+
+def compute_spw(pos: float, neg: float, cap: float, power: float) -> float:
+    if pos <= 0:
+        return 1.0
+    return float(min((neg / pos) ** power, cap))
+
+def tail_weight(k: int, K: int, gamma: float) -> float:
+    return float(1.0 + gamma * (k / (K - 1))) if K > 1 else 1.0
+
+
 class LGBMCoralModel:
-    models: list
-    n_classes: int
+    def __init__(self, models, n_classes: int):
+        self.models = models
+        self.n_classes = n_classes
 
     def predict_proba_gt(self, X) -> np.ndarray:
         return np.vstack([m.predict(X, num_iteration=m.best_iteration) for m in self.models]).T
@@ -207,26 +182,32 @@ class LGBMCoralModel:
     def predict(self, X, threshold: float) -> np.ndarray:
         return decode_coral(self.predict_proba_gt(X), threshold)
 
-def train_lgbm_coral(X_tr, y_tr, K, X_va, y_va, base_params):
+
+def train_coral_with_weights(X_tr, y_tr, X_va, y_va, K, base_params, weight_cfg):
     Yt = make_coral_targets(y_tr, K)
     Yv = make_coral_targets(y_va, K)
 
     models = []
+    diag = []
+
     for k in range(K - 1):
         yk_tr = Yt[:, k]
         dtrain = lgb.Dataset(X_tr, label=yk_tr, free_raw_data=False)
+        dvalid = lgb.Dataset(X_va, label=Yv[:, k], reference=dtrain, free_raw_data=False)
 
         pos = float(yk_tr.sum())
         neg = float(len(yk_tr) - pos)
-        spw = (neg / pos) if pos > 0 else 1.0
+
+        spw_base = compute_spw(pos, neg, cap=weight_cfg["cap"], power=weight_cfg["power"])
+        spw = spw_base * tail_weight(k, K, gamma=weight_cfg["gamma"])
 
         params = dict(base_params)
-        params["scale_pos_weight"] = spw
-        params["objective"] = "binary"
-        params["metric"] = "binary_logloss"
-        params["verbosity"] = -1
-
-        dvalid = lgb.Dataset(X_va, label=Yv[:, k], reference=dtrain, free_raw_data=False)
+        params.update({
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "verbosity": -1,
+            "scale_pos_weight": spw,
+        })
 
         booster = lgb.train(
             params=params,
@@ -236,42 +217,47 @@ def train_lgbm_coral(X_tr, y_tr, K, X_va, y_va, base_params):
             valid_names=["train", "valid"],
             callbacks=[lgb.early_stopping(150, verbose=False)],
         )
+
         models.append(booster)
+        diag.append({
+            "k": k,
+            "task": f"y > {k}",
+            "pos": int(pos),
+            "neg": int(neg),
+            "spw_used": float(spw),
+            "best_iter": int(booster.best_iteration or 0),
+        })
 
-    return LGBMCoralModel(models=models, n_classes=K)
+    return LGBMCoralModel(models, K), diag
 
-def dist_pct(y, K):
-    c = np.bincount(np.asarray(y).astype(int), minlength=K).astype(float)
-    s = c.sum()
-    return c / s if s > 0 else np.zeros(K)
 
-def tune_threshold(proba_gt_va, y_va, K, train_pct, grid=np.linspace(0.3,0.7,17), alpha=0.7):
+def tune_decode_threshold(proba_gt_va, y_va, K, train_pct, grid, alpha):
     best = None
     rows = []
     for t in grid:
-        y_hat = decode_coral(proba_gt_va, float(t))
+        t = float(t)
+        y_hat = decode_coral(proba_gt_va, t)
         mae = float(mean_absolute_error(y_va, y_hat))
         pred_pct = dist_pct(y_hat, K)
         drift = float(np.sum(np.abs(pred_pct - train_pct)))
         score = alpha * mae + (1 - alpha) * drift
-        rows.append({"threshold": float(t), "mae": mae, "drift_l1": drift, "score": score})
+        row = {"threshold": t, "mae": mae, "drift_l1": drift, "score": score}
+        rows.append(row)
         if best is None or score < best["score"]:
-            best = {"threshold": float(t), "mae": mae, "drift_l1": drift, "score": score}
+            best = row
     return best, rows
 
+
 def main():
-    TRAIN_CSV = "training_data.csv"
-    TARGETS = ["y_target1", "y_target2", "y_target3"]  # <-- edit
-    ID_COL = "record_id"  # optional (doesn't affect training)
+    os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
+    os.makedirs(config.STAGE0_REPORT_DIR, exist_ok=True)
+    os.makedirs(config.MODELS_DIR, exist_ok=True)
 
-    OUT_STAGE0 = "artifacts/stage0_features.joblib"
-    OUT_STAGE0_REPORT = "artifacts/stage0_reports"
-    OUT_MODELS = "artifacts/coral_models"
-    os.makedirs(OUT_MODELS, exist_ok=True)
+    df = pd.read_csv(config.TRAIN_CSV)
 
-    df = pd.read_csv(TRAIN_CSV)
+    exclude = set(config.TARGETS + ([config.ID_COL] if config.ID_COL and config.ID_COL in df.columns else []))
+    feature_cols = [c for c in df.columns if c not in exclude]
 
-    feature_cols = [c for c in df.columns if c not in TARGETS + ([ID_COL] if ID_COL in df.columns else [])]
     X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     # 80/20 split
@@ -280,56 +266,90 @@ def main():
     X_tr, X_va = X.iloc[idx_tr], X.iloc[idx_va]
 
     # Stage-0 fit on train only (use first target for importance ranking)
-    stage0 = Stage0FeatureFilter(Stage0Config(missing_threshold=0.80, corr_threshold=0.95, max_corr_features=400))
-    stage0.fit(X_tr, df.iloc[idx_tr][TARGETS[0]].astype(int).values)
-    X_tr_f = stage0.transform(X_tr)
-    X_va_f = stage0.transform(X_va)
-    stage0.save(OUT_STAGE0)
-    stage0.export_report(OUT_STAGE0_REPORT)
+    stage0_art = stage0_fit_transform(X_tr, df.iloc[idx_tr][config.TARGETS[0]].astype(int).values)
 
-    base_params = {
-        "learning_rate": 0.05,
-        "num_leaves": 63,
-        "min_data_in_leaf": 30,
-        "feature_fraction": 0.9,
-        "bagging_fraction": 0.9,
-        "bagging_freq": 1,
-        "lambda_l2": 1.0,
-        "seed": 42,
-    }
+    # Save Stage-0 artifact + reports
+    joblib.dump(stage0_art, config.STAGE0_PATH)
+    pd.Series(stage0_art["selected_features"]).to_csv(f"{config.STAGE0_REPORT_DIR}/selected_features.csv", index=False)
+    pd.Series(stage0_art["dropped_missing"]).to_csv(f"{config.STAGE0_REPORT_DIR}/dropped_missing.csv", index=False)
+    pd.Series(stage0_art["dropped_corr"]).to_csv(f"{config.STAGE0_REPORT_DIR}/dropped_corr.csv", index=False)
+    pd.DataFrame(stage0_art["corr_pairs_dropped"], columns=["kept", "dropped", "abs_corr"]).to_csv(
+        f"{config.STAGE0_REPORT_DIR}/corr_pairs_dropped.csv", index=False
+    )
 
-    for t in TARGETS:
+    sel = stage0_art["selected_features"]
+    X_tr_f = X_tr[sel].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    X_va_f = X_va[sel].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # Train per target with weight tuning + threshold tuning
+    for t in config.TARGETS:
         y_tr = df.iloc[idx_tr][t].astype(int).values
         y_va = df.iloc[idx_va][t].astype(int).values
-
         K = int(np.max(df[t].dropna().astype(int).values) + 1)
 
-        coral = train_lgbm_coral(X_tr_f, y_tr, K, X_va_f, y_va, base_params)
-        train_pct = dist_pct(y_tr, K)
+        candidates = []
+        for wcfg in config.WEIGHT_GRID:
+            coral, diag = train_coral_with_weights(
+                X_tr_f, y_tr, X_va_f, y_va, K, config.LGB_BASE_PARAMS, wcfg
+            )
+            train_pct = dist_pct(y_tr, K)
+            proba_gt_va = coral.predict_proba_gt(X_va_f)
+            best_thr, thr_grid = tune_decode_threshold(
+                proba_gt_va, y_va, K, train_pct, config.DECODE_GRID, config.ALPHA
+            )
+            candidates.append({
+                "weight_cfg": wcfg,
+                "coral": coral,
+                "diag": diag,
+                "train_pct": train_pct,
+                "best_thr": best_thr,
+                "thr_grid": thr_grid,
+            })
 
-        proba_gt_va = coral.predict_proba_gt(X_va_f)
-        best, grid_rows = tune_threshold(proba_gt_va, y_va, K, train_pct, alpha=0.7)
+        candidates.sort(key=lambda d: d["best_thr"]["score"])
+        best = candidates[0]
 
         artifact = {
             "target": t,
             "n_classes": K,
-            "decode_threshold": best["threshold"],
-            "train_distribution_pct": train_pct.tolist(),
-            "tuning_best": best,
-            "tuning_grid": grid_rows,
-            "feature_cols": stage0.artifacts.selected_features,
-            "model": coral,
+            "decode_threshold": float(best["best_thr"]["threshold"]),
+            "train_distribution_pct": best["train_pct"].tolist(),
+            "tuning_best": best["best_thr"],
+            "tuning_grid": best["thr_grid"],
+            "weight_cfg_best": best["weight_cfg"],
+            "threshold_diagnostics": best["diag"],
+            "feature_cols": sel,
+            "model": best["coral"],
         }
 
-        path = os.path.join(OUT_MODELS, f"{t}_coral_artifact.joblib")
-        joblib.dump(artifact, path)
-        print(f"Saved {t} -> {path} (best_thr={best['threshold']:.2f}, mae={best['mae']:.3f}, drift={best['drift_l1']:.3f})")
+        out_path = f"{config.MODELS_DIR}/{t}_coral_artifact.joblib"
+        joblib.dump(artifact, out_path)
+
+        with open(f"{config.MODELS_DIR}/{t}_training_summary.json", "w") as f:
+            json.dump(
+                {
+                    "target": t,
+                    "K": K,
+                    "decode_threshold": artifact["decode_threshold"],
+                    "best_weight_cfg": artifact["weight_cfg_best"],
+                    "best_mae": artifact["tuning_best"]["mae"],
+                    "best_drift_l1": artifact["tuning_best"]["drift_l1"],
+                    "best_score": artifact["tuning_best"]["score"],
+                },
+                f,
+                indent=2,
+            )
+
+        print(
+            f"[{t}] saved {out_path} | weights={artifact['weight_cfg_best']} | "
+            f"thr={artifact['decode_threshold']:.2f} | mae={artifact['tuning_best']['mae']:.3f} | "
+            f"drift={artifact['tuning_best']['drift_l1']:.3f}"
+        )
+
 
 if __name__ == "__main__":
     main()
 
-
-### Stage 3
 
 # coral_score_unseen.py
 import os
@@ -339,7 +359,7 @@ import joblib
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-from stage0_feature_filter import Stage0FeatureFilter
+import config
 
 
 def dist_pct(y: np.ndarray, K: int) -> np.ndarray:
@@ -378,23 +398,18 @@ def add_page(pdf, target, train_pct, pred_pct, checks):
     classes = np.arange(K)
     delta = pred_pct - train_pct
 
-    fig = plt.figure(figsize=(8.27, 11.69))  # A4 portrait-ish
-
+    fig = plt.figure(figsize=(8.27, 11.69))
     ax1 = plt.subplot(3, 1, 1)
     w = 0.4
     ax1.bar(classes - w/2, train_pct*100, width=w, label="Train %")
     ax1.bar(classes + w/2, pred_pct*100, width=w, label="Unseen Pred %")
-    ax1.set_xticks(classes)
-    ax1.set_xlabel("Class")
-    ax1.set_ylabel("Percent")
+    ax1.set_xticks(classes); ax1.set_xlabel("Class"); ax1.set_ylabel("Percent")
     ax1.set_title(f"{target} — Train vs Unseen Predicted Distribution")
     ax1.legend()
 
     ax2 = plt.subplot(3, 1, 2)
     ax2.bar(classes, delta*100)
-    ax2.set_xticks(classes)
-    ax2.set_xlabel("Class")
-    ax2.set_ylabel("Delta (pp)")
+    ax2.set_xticks(classes); ax2.set_xlabel("Class"); ax2.set_ylabel("Delta (pp)")
     ax2.set_title("Unseen Pred % minus Train % (percentage points)")
 
     ax3 = plt.subplot(3, 1, 3)
@@ -412,36 +427,28 @@ def add_page(pdf, target, train_pct, pred_pct, checks):
     pdf.savefig(fig)
     plt.close(fig)
 
+
 def main():
-    UNSEEN_CSV = "unseen_data.csv"
-    TARGETS = ["y_target1", "y_target2", "y_target3"]   # <-- edit
-    ID_COL = "record_id"  # optional
+    os.makedirs(config.UNSEEN_REPORT_DIR, exist_ok=True)
 
-    STAGE0_PATH = "artifacts/stage0_features.joblib"
-    MODELS_DIR = "artifacts/coral_models"
-    OUT_DIR = "unseen_reports"
-    os.makedirs(OUT_DIR, exist_ok=True)
+    stage0_art = joblib.load(config.STAGE0_PATH)
+    feature_cols = stage0_art["selected_features"]
 
-    df_unseen = pd.read_csv(UNSEEN_CSV)
+    df_unseen = pd.read_csv(config.UNSEEN_CSV)
 
-    # Use the exact feature set saved in Stage-0
-    stage0 = Stage0FeatureFilter.load(STAGE0_PATH)
-    feature_cols = stage0.artifacts.selected_features
-
-    # Build X_unseen and ensure all required columns exist
+    # Build X_unseen with required columns
     X_unseen = df_unseen.copy()
     for c in feature_cols:
         if c not in X_unseen.columns:
             X_unseen[c] = 0.0
     X_unseen = X_unseen[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    combined_pdf = os.path.join(OUT_DIR, "business_report_unseen.pdf")
+    combined_pdf = os.path.join(config.UNSEEN_REPORT_DIR, config.COMBINED_PDF_NAME)
     checks_rows = []
 
     with PdfPages(combined_pdf) as pdf:
-        for t in TARGETS:
-            artifact_path = os.path.join(MODELS_DIR, f"{t}_coral_artifact.joblib")
-            art = joblib.load(artifact_path)
+        for t in config.TARGETS:
+            art = joblib.load(f"{config.MODELS_DIR}/{t}_coral_artifact.joblib")
 
             K = art["n_classes"]
             thr = art["decode_threshold"]
@@ -452,30 +459,30 @@ def main():
             pred_pct = dist_pct(y_pred, K)
             checks = sanity_checks(train_pct, pred_pct)
 
-            # --- per-target prediction CSV ---
+            # per-target prediction CSV
             pred_df = pd.DataFrame({f"{t}_pred": y_pred})
-            if ID_COL in df_unseen.columns:
-                pred_df.insert(0, ID_COL, df_unseen[ID_COL].values)
-            pred_df.to_csv(os.path.join(OUT_DIR, f"{t}_unseen_predictions.csv"), index=False)
+            if config.ID_COL and config.ID_COL in df_unseen.columns:
+                pred_df.insert(0, config.ID_COL, df_unseen[config.ID_COL].values)
+            pred_df.to_csv(os.path.join(config.UNSEEN_REPORT_DIR, f"{t}_unseen_predictions.csv"), index=False)
 
-            # --- per-target distribution CSV ---
+            # per-target distribution CSV
             dist_df = pd.DataFrame({
                 "class": np.arange(K),
                 "train_pct": train_pct,
                 "unseen_pred_pct": pred_pct,
                 "delta_pct": pred_pct - train_pct,
             })
-            dist_df.to_csv(os.path.join(OUT_DIR, f"{t}_distribution_compare.csv"), index=False)
+            dist_df.to_csv(os.path.join(config.UNSEEN_REPORT_DIR, f"{t}_distribution_compare.csv"), index=False)
 
-            # --- add PDF page ---
+            # pdf page
             add_page(pdf, t, train_pct, pred_pct, checks)
 
-            checks_rows.append({"target": t, "decode_threshold": thr, **checks})
+            checks_rows.append({"target": t, "decode_threshold": thr, "best_weight_cfg": art.get("weight_cfg_best", {}), **checks})
 
-    pd.DataFrame(checks_rows).to_csv(os.path.join(OUT_DIR, "combined_sanity_checks.csv"), index=False)
+    pd.DataFrame(checks_rows).to_csv(os.path.join(config.UNSEEN_REPORT_DIR, "combined_sanity_checks.csv"), index=False)
+    print("Saved:", combined_pdf)
+    print("Saved per-target CSVs in:", config.UNSEEN_REPORT_DIR)
 
-    print("Saved combined PDF:", combined_pdf)
-    print("Saved per-target CSVs in:", OUT_DIR)
 
 if __name__ == "__main__":
     main()
