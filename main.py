@@ -1,619 +1,209 @@
-# dtype_utils.py
-"""
-Reusable pandas dtype utilities for ML pipelines.
-
-Design goals:
-- Never let object dtypes reach models
-- Clean ordinal targets safely
-- Coerce numeric-like strings
-- Drop unusable features deterministically
-- Fail fast if invariants are violated
-"""
-
 import numpy as np
 import pandas as pd
 
-
-# --------------------------------------------------
-# Ordinal target cleaning (CORAL-safe)
-# --------------------------------------------------
-def clean_ordinal_targets(df: pd.DataFrame, targets: list[str]) -> pd.DataFrame:
+def _psi_numeric(train: pd.Series, unseen: pd.Series, bins: int = 10) -> float:
     """
-    Extract leading integer from ordinal target labels.
-    Example: '0.never' -> 0, '2.high' -> 2
-
-    Rows with invalid targets become NaN and are dropped.
+    Population Stability Index for numeric features.
+    Uses quantile bins from train to be robust.
     """
-    df = df.copy()
+    tr = train.replace([np.inf, -np.inf], np.nan).dropna()
+    un = unseen.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(tr) < 50 or len(un) < 50:
+        return 0.0
 
-    def _clean(s: pd.Series) -> pd.Series:
-        return (
-            s.astype(str)
-             .str.extract(r"^(\d+)", expand=False)
-             .astype(float)
-        )
+    qs = np.linspace(0, 1, bins + 1)
+    edges = np.unique(tr.quantile(qs).values)
+    if len(edges) <= 2:
+        return 0.0
 
-    for t in targets:
-        if t not in df.columns:
-            raise KeyError(f"Target column not found: {t}")
-        df[t] = _clean(df[t])
+    tr_bin = pd.cut(tr, bins=edges, include_lowest=True).value_counts(normalize=True)
+    un_bin = pd.cut(un, bins=edges, include_lowest=True).value_counts(normalize=True)
 
-    # drop rows with invalid targets
-    df = df.dropna(subset=targets)
+    # align
+    tr_bin, un_bin = tr_bin.align(un_bin, fill_value=0.0)
 
-    # enforce integer dtype
-    df[targets] = df[targets].astype(int)
+    eps = 1e-6
+    tr_p = np.clip(tr_bin.values, eps, 1.0)
+    un_p = np.clip(un_bin.values, eps, 1.0)
 
-    return df
+    return float(np.sum((un_p - tr_p) * np.log(un_p / tr_p)))
 
 
-# --------------------------------------------------
-# Feature dtype cleaning
-# --------------------------------------------------
-def fix_feature_dtypes(
-    df: pd.DataFrame,
-    feature_cols: list[str],
+def stage0_stability_filter(
+    X_train: pd.DataFrame,
+    X_unseen: pd.DataFrame,
+    candidate_features: list[str],
     *,
-    numeric_ratio_threshold: float = 0.80,
-    min_non_null_ratio: float = 0.20,
-) -> tuple[pd.DataFrame, list[str], dict]:
-    """
-    Fix bad pandas dtypes in feature columns.
-
-    Strategy:
-    - object columns:
-        - if >= numeric_ratio_threshold numeric-like -> coerce to numeric
-        - else -> drop
-    - drop columns mostly NaN after coercion
-    - replace inf/-inf
-    - fill NaN with 0.0
-
-    Returns:
-        df_clean
-        new_feature_cols
-        report (dict for logging/debugging)
-    """
-    df = df.copy()
-
-    obj_cols = [c for c in feature_cols if c in df.columns and df[c].dtype == "object"]
-
-    def numeric_like_ratio(s: pd.Series, sample_size: int = 2000) -> float:
-        x = s.dropna().astype(str).head(sample_size)
-        if len(x) == 0:
-            return 0.0
-        x = (
-            x.str.replace(",", "", regex=False)
-             .str.strip()
-        )
-        return float(
-            x.str.match(r"^-?\d+(\.\d+)?$", na=False).mean()
-        )
-
-    numeric_like = []
-    non_numeric = []
-
-    for c in obj_cols:
-        r = numeric_like_ratio(df[c])
-        if r >= numeric_ratio_threshold:
-            numeric_like.append(c)
-        else:
-            non_numeric.append(c)
-
-    # --- coerce numeric-like object columns
-    for c in numeric_like:
-        df[c] = (
-            df[c]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .str.strip()
-        )
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # --- drop non-numeric object columns
-    drop_cols = list(non_numeric)
-
-    # --- drop columns that are mostly NaN after coercion
-    for c in feature_cols:
-        if c in df.columns:
-            if df[c].notna().mean() < min_non_null_ratio:
-                drop_cols.append(c)
-
-    drop_cols = sorted(set(drop_cols))
-    df = df.drop(columns=[c for c in drop_cols if c in df.columns])
-
-    new_feature_cols = [c for c in feature_cols if c not in drop_cols]
-
-    # --- final safety check
-    still_object = [c for c in new_feature_cols if df[c].dtype == "object"]
-    if still_object:
-        raise ValueError(f"Object dtypes remain after cleaning: {still_object}")
-
-    # --- LightGBM-safe cleanup
-    df[new_feature_cols] = (
-        df[new_feature_cols]
-        .replace([np.inf, -np.inf], np.nan)
-        .fillna(0.0)
-    )
-
-    report = {
-        "object_features_initial": obj_cols,
-        "numeric_like_converted": numeric_like,
-        "non_numeric_dropped": non_numeric,
-        "dropped_low_signal": [c for c in drop_cols if c not in non_numeric],
-        "final_feature_count": len(new_feature_cols),
-    }
-
-    return df, new_feature_cols, report
-
-
-# --------------------------------------------------
-# Assertions (fail fast)
-# --------------------------------------------------
-def assert_numeric_features(df: pd.DataFrame, feature_cols: list[str]):
-    bad = [c for c in feature_cols if df[c].dtype == "object"]
-    if bad:
-        raise AssertionError(f"Non-numeric features detected: {bad}")
-
-
-def assert_integer_targets(df: pd.DataFrame, targets: list[str]):
-    for t in targets:
-        if not pd.api.types.is_integer_dtype(df[t]):
-            raise AssertionError(f"Target '{t}' is not integer dtype")
-
-
-
-# coral_train.py
-import os
-import json
-import numpy as np
-import pandas as pd
-import joblib
-import lightgbm as lgb
-
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
-
-from dtype_utils import (
-    clean_ordinal_targets,
-    fix_feature_dtypes,
-    assert_numeric_features,
-    assert_integer_targets,
-)
-
-# =============================
-# CONFIG (EDIT HERE)
-# =============================
-TRAIN_CSV = "training_data.csv"
-TARGETS = ["y_target1", "y_target2", "y_target3"]   # <-- EDIT
-ID_COL = "record_id"                                # optional, or None
-
-ARTIFACT_DIR = "artifacts"
-MODEL_DIR = f"{ARTIFACT_DIR}/coral_models"
-STAGE0_PATH = f"{ARTIFACT_DIR}/stage0_features.joblib"
-RUN_REPORT_PATH = f"{ARTIFACT_DIR}/dtype_report_train.json"
-
-os.makedirs(ARTIFACT_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-# Decode threshold tuning
-DECODE_GRID = [0.4, 0.5, 0.6]
-ALPHA = 0.7
-
-# Improved weight config (single business-safe default)
-WEIGHT_CFG = {"power": 0.5, "cap": 12.0, "gamma": 0.3}
-
-# LightGBM base params (fast-ish defaults)
-LGB_BASE_PARAMS = {
-    "learning_rate": 0.05,
-    "num_leaves": 31,
-    "min_data_in_leaf": 80,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
-    "bagging_freq": 1,
-    "lambda_l2": 1.0,
-    "max_bin": 255,
-    "verbosity": -1,
-    "seed": 42,
-}
-
-NUM_BOOST_ROUND = 1200
-EARLY_STOPPING_ROUNDS = 80
-
-
-# =============================
-# CORAL helpers
-# =============================
-def make_coral_targets(y: np.ndarray, K: int) -> np.ndarray:
-    y = np.asarray(y).astype(int)
-    thr = np.arange(K - 1)
-    return (y[:, None] > thr[None, :]).astype(np.int8)
-
-def decode_coral(proba_gt: np.ndarray, t: float) -> np.ndarray:
-    return (proba_gt >= float(t)).sum(axis=1).astype(int)
-
-def dist_pct(y: np.ndarray, K: int) -> np.ndarray:
-    y = np.asarray(y).astype(int)
-    c = np.bincount(y, minlength=K).astype(float)
-    s = c.sum()
-    return c / s if s > 0 else np.zeros(K, dtype=float)
-
-def compute_spw(pos: float, neg: float, cap: float, power: float) -> float:
-    if pos <= 0:
-        return 1.0
-    return float(min((neg / pos) ** power, cap))
-
-def tail_weight(k: int, K: int, gamma: float) -> float:
-    return float(1.0 + gamma * (k / (K - 1))) if K > 1 else 1.0
-
-
-def train_one_target_coral(
-    X_tr: pd.DataFrame,
-    y_tr: np.ndarray,
-    X_va: pd.DataFrame,
-    y_va: np.ndarray,
-    K: int,
+    miss_unseen_max: float = 0.80,
+    miss_shift_max: float = 0.30,
+    zshift_max: float = 1.5,
+    use_psi: bool = False,
+    psi_max: float = 0.25,
+    psi_bins: int = 10,
 ):
     """
-    Train CORAL (K-1 binary LGBM models) and tune decode threshold.
-    Returns:
-      boosters: list[lgb.Booster]
-      best: dict
-      train_pct: np.ndarray
-      thr_grid_rows: list[dict]
-      threshold_diag: list[dict]
+    Returns: kept_features, drop_report_df
     """
-    Yt = make_coral_targets(y_tr, K)
-    Yv = make_coral_targets(y_va, K)
+    feats = [f for f in candidate_features if f in X_train.columns]
+    # ensure unseen has columns
+    for f in feats:
+        if f not in X_unseen.columns:
+            X_unseen[f] = np.nan
 
-    boosters = []
-    threshold_diag = []
+    miss_tr = X_train[feats].isna().mean()
+    miss_un = X_unseen[feats].isna().mean()
+    miss_shift = (miss_un - miss_tr).abs()
 
-    for k in range(K - 1):
-        yk_tr = Yt[:, k]
-        yk_va = Yv[:, k]
+    # numeric stats (coerce to numeric where possible)
+    Xt = X_train[feats].copy()
+    Xu = X_unseen[feats].copy()
 
-        pos = float(yk_tr.sum())
-        neg = float(len(yk_tr) - pos)
+    for f in feats:
+        if Xt[f].dtype == "object":
+            Xt[f] = pd.to_numeric(Xt[f], errors="coerce")
+        if Xu[f].dtype == "object":
+            Xu[f] = pd.to_numeric(Xu[f], errors="coerce")
 
-        spw_base = compute_spw(pos, neg, cap=WEIGHT_CFG["cap"], power=WEIGHT_CFG["power"])
-        spw = spw_base * tail_weight(k, K, gamma=WEIGHT_CFG["gamma"])
+    mean_tr = Xt.mean(numeric_only=True)
+    std_tr = Xt.std(numeric_only=True).replace(0, np.nan)
+    mean_un = Xu.mean(numeric_only=True)
 
-        params = dict(LGB_BASE_PARAMS)
-        params.update({
-            "objective": "binary",
-            "metric": "binary_logloss",
-            "scale_pos_weight": spw,
-        })
+    zshift = ((mean_un - mean_tr).abs() / std_tr).reindex(feats).fillna(0.0)
 
-        dtrain = lgb.Dataset(X_tr, label=yk_tr, free_raw_data=False)
-        dvalid = lgb.Dataset(X_va, label=yk_va, reference=dtrain, free_raw_data=False)
+    psi = pd.Series(0.0, index=feats)
+    if use_psi:
+        for f in feats:
+            if pd.api.types.is_numeric_dtype(Xt[f]):
+                psi[f] = _psi_numeric(Xt[f], Xu[f], bins=psi_bins)
 
-        booster = lgb.train(
-            params=params,
-            train_set=dtrain,
-            num_boost_round=NUM_BOOST_ROUND,
-            valid_sets=[dvalid],
-            valid_names=["valid"],
-            callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
-        )
-        boosters.append(booster)
+    drop_reasons = []
+    for f in feats:
+        reasons = []
+        if miss_un[f] > miss_unseen_max:
+            reasons.append(f"miss_unseen>{miss_unseen_max}")
+        if miss_shift[f] > miss_shift_max:
+            reasons.append(f"miss_shift>{miss_shift_max}")
+        if zshift[f] > zshift_max:
+            reasons.append(f"zshift>{zshift_max}")
+        if use_psi and psi[f] > psi_max:
+            reasons.append(f"psi>{psi_max}")
+        drop_reasons.append("|".join(reasons))
 
-        threshold_diag.append({
-            "k": k,
-            "task": f"y > {k}",
-            "pos": int(pos),
-            "neg": int(neg),
-            "scale_pos_weight": float(spw),
-            "best_iteration": int(booster.best_iteration or 0),
-        })
+    report = pd.DataFrame({
+        "feature": feats,
+        "miss_train": miss_tr.values,
+        "miss_unseen": miss_un.values,
+        "miss_shift_abs": miss_shift.values,
+        "zshift": zshift.values,
+        "psi": psi.values if use_psi else np.zeros(len(feats)),
+        "drop_reasons": drop_reasons,
+    })
 
-    # Tune decode threshold on validation
-    proba_gt_va = np.vstack([b.predict(X_va, num_iteration=b.best_iteration) for b in boosters]).T
-    train_pct = dist_pct(y_tr, K)
+    kept = report[report["drop_reasons"] == ""]["feature"].tolist()
+    dropped = report[report["drop_reasons"] != ""]
 
-    best = None
-    thr_grid_rows = []
-    for t in DECODE_GRID:
-        y_hat = decode_coral(proba_gt_va, t)
-        mae = float(mean_absolute_error(y_va, y_hat))
-        pred_pct = dist_pct(y_hat, K)
-        drift = float(np.sum(np.abs(pred_pct - train_pct)))
-        score = float(ALPHA * mae + (1.0 - ALPHA) * drift)
-
-        row = {"threshold": float(t), "mae": mae, "drift_l1": drift, "score": score}
-        thr_grid_rows.append(row)
-        if best is None or score < best["score"]:
-            best = row
-
-    return boosters, best, train_pct, thr_grid_rows, threshold_diag
-
-
-def main():
-    # -------------------------
-    # Load & clean training data
-    # -------------------------
-    df = pd.read_csv(TRAIN_CSV)
-
-    # Clean ordinal targets first
-    df = clean_ordinal_targets(df, TARGETS)
-    assert_integer_targets(df, TARGETS)
-
-    # Build feature columns
-    exclude = set(TARGETS + ([ID_COL] if ID_COL and ID_COL in df.columns else []))
-    feature_cols = [c for c in df.columns if c not in exclude]
-
-    # Fix feature dtypes
-    df, feature_cols, dtype_report = fix_feature_dtypes(df, feature_cols)
-    assert_numeric_features(df, feature_cols)
-
-    # Save dtype report (audit/debug)
-    with open(RUN_REPORT_PATH, "w") as f:
-        json.dump(dtype_report, f, indent=2)
-
-    # Save Stage-0 feature list (used by Stage-3)
-    joblib.dump({"selected_features": feature_cols}, STAGE0_PATH)
-
-    X = df[feature_cols]
-
-    # 80/20 split
-    idx = np.arange(len(df))
-    idx_tr, idx_va = train_test_split(idx, test_size=0.20, random_state=42, shuffle=True)
-    X_tr, X_va = X.iloc[idx_tr], X.iloc[idx_va]
-
-    # -------------------------
-    # Train per target
-    # -------------------------
-    for tgt in TARGETS:
-        y_tr = df.iloc[idx_tr][tgt].astype(int).values
-        y_va = df.iloc[idx_va][tgt].astype(int).values
-
-        # assumes labels are 0..K-1
-        K = int(max(df[tgt].max() + 1, 2))
-
-        boosters, best, train_pct, thr_grid_rows, threshold_diag = train_one_target_coral(
-            X_tr=X_tr, y_tr=y_tr,
-            X_va=X_va, y_va=y_va,
-            K=K,
-        )
-
-        artifact = {
-            "target": tgt,
-            "n_classes": K,
-            "decode_threshold": float(best["threshold"]),
-            "train_distribution_pct": train_pct.tolist(),
-
-            # boosters only (no custom class pickle issues)
-            "model_boosters": boosters,
-
-            # traceability
-            "tuning_alpha": float(ALPHA),
-            "weight_cfg": WEIGHT_CFG,
-            "decode_tuning_best": best,
-            "decode_tuning_grid": thr_grid_rows,
-            "threshold_diagnostics": threshold_diag,
-            "feature_cols": feature_cols,
-        }
-
-        out_path = os.path.join(MODEL_DIR, f"{tgt}_coral_artifact.joblib")
-        joblib.dump(artifact, out_path)
-
-        # summary json (fast glance)
-        with open(os.path.join(MODEL_DIR, f"{tgt}_training_summary.json"), "w") as f:
-            json.dump(
-                {
-                    "target": tgt,
-                    "n_classes": K,
-                    "decode_threshold": artifact["decode_threshold"],
-                    "mae": best["mae"],
-                    "drift_l1": best["drift_l1"],
-                    "score": best["score"],
-                    "weight_cfg": WEIGHT_CFG,
-                },
-                f,
-                indent=2,
-            )
-
-        print(
-            f"[{tgt}] saved {out_path} | "
-            f"thr={best['threshold']:.2f} | MAE={best['mae']:.3f} | drift={best['drift_l1']:.3f}"
-        )
-
-
-if __name__ == "__main__":
-    main()
+    return kept, report.sort_values(
+        by=["drop_reasons", "miss_shift_abs", "zshift"],
+        ascending=[False, False, False]
+    )
 
 
 
-# coral_score_unseen.py
-import os
-import json
-import numpy as np
-import pandas as pd
-import joblib
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
+# Load unseen just for stability filtering (no labels needed)
+df_unseen = pd.read_csv(config.UNSEEN_CSV)
 
-from dtype_utils import fix_feature_dtypes, assert_numeric_features
+# Build unseen feature frame with same raw feature columns
+# (if some missing, they stay NaN, which is what we want here)
+X_unseen_raw = df_unseen.copy()
+for c in feature_cols:  # original feature cols before Stage-0
+    if c not in X_unseen_raw.columns:
+        X_unseen_raw[c] = np.nan
 
-# =============================
-# CONFIG (EDIT HERE)
-# =============================
-UNSEEN_CSV = "unseen_data.csv"
-TARGETS = ["y_target1", "y_target2", "y_target3"]   # same list as training
-ID_COL = "record_id"                                # optional, or None
+X_unseen_raw = X_unseen_raw[feature_cols]  # keep same order
+X_unseen_raw = X_unseen_raw.replace([np.inf, -np.inf], np.nan)
 
-ARTIFACT_DIR = "artifacts"
-MODEL_DIR = f"{ARTIFACT_DIR}/coral_models"
-STAGE0_PATH = f"{ARTIFACT_DIR}/stage0_features.joblib"
+# Apply stability filter on Stage-0 selected features
+sel_stable, stability_report = stage0_stability_filter(
+    X_train=X_tr[sel],
+    X_unseen=X_unseen_raw[sel],
+    candidate_features=sel,
+    miss_unseen_max=0.80,
+    miss_shift_max=0.30,
+    zshift_max=1.5,
+    use_psi=False,      # start False; turn True later if needed
+)
 
-OUT_DIR = "unseen_reports"
-DTYPE_REPORT_PATH = f"{OUT_DIR}/dtype_report_unseen.json"
-COMBINED_PDF = f"{OUT_DIR}/business_report_unseen.pdf"
+print(f"[Stage0b] selected={len(sel)} stable={len(sel_stable)} dropped={len(sel)-len(sel_stable)}")
+stability_report.to_csv(f"{config.STAGE0_REPORT_DIR}/stability_report.csv", index=False)
 
-os.makedirs(OUT_DIR, exist_ok=True)
+# Replace your feature list with stable features
+sel = sel_stable
 
 
-# =============================
-# CORAL helpers
-# =============================
-def decode_coral(proba_gt: np.ndarray, t: float) -> np.ndarray:
-    return (proba_gt >= float(t)).sum(axis=1).astype(int)
 
-def dist_pct(y: np.ndarray, K: int) -> np.ndarray:
-    y = np.asarray(y).astype(int)
-    c = np.bincount(y, minlength=K).astype(float)
-    s = c.sum()
-    return c / s if s > 0 else np.zeros(K, dtype=float)
-
-def sanity_checks(train_pct, pred_pct, rare_threshold=0.02, collapse_ratio=0.2, spike_ratio=3.0, drift_l1_warn=0.20):
-    drift_l1 = float(np.sum(np.abs(pred_pct - train_pct)))
-    rare = np.where(train_pct <= rare_threshold)[0].tolist()
-    collapsed, spiked = [], []
-    for c in rare:
-        tp, pp = float(train_pct[c]), float(pred_pct[c])
-        if tp > 0 and pp < tp * collapse_ratio:
-            collapsed.append(int(c))
-        if tp > 0 and pp > tp * spike_ratio:
-            spiked.append(int(c))
-    top_class = int(np.argmax(pred_pct))
-    top_pct = float(np.max(pred_pct))
-    return {
-        "drift_l1": drift_l1,
-        "drift_l1_warn": drift_l1 >= drift_l1_warn,
-        "rare_classes_by_train": rare,
-        "rare_collapsed": collapsed,
-        "rare_spiked": spiked,
-        "rare_collapsed_warn": len(collapsed) > 0,
-        "rare_spiked_warn": len(spiked) > 0,
-        "top_class": top_class,
-        "top_class_pct": top_pct,
-        "top_class_dominates_warn": top_pct >= 0.90,
-    }
-
-def add_page(pdf, target, train_pct, pred_pct, checks):
+def go_no_go(train_pct, pred_pct, drift_l1, top_class_pct):
     K = len(train_pct)
-    classes = np.arange(K)
-    delta = pred_pct - train_pct
+    # rare defined as >=1% in training (business-relevant)
+    rare_business = [k for k in range(K) if train_pct[k] >= 0.01]
+    collapsed = [k for k in rare_business if pred_pct[k] == 0.0]
+    spiked = [k for k in range(K) if train_pct[k] > 0 and pred_pct[k] > 3.0 * train_pct[k]]
 
-    fig = plt.figure(figsize=(8.27, 11.69))  # A4 portrait-ish
+    hard_fail = (
+        (top_class_pct >= 0.90) or
+        (drift_l1 >= 0.35) or
+        (len(collapsed) > 0)
+    )
 
-    ax1 = plt.subplot(3, 1, 1)
-    w = 0.4
-    ax1.bar(classes - w/2, train_pct*100, width=w, label="Train %")
-    ax1.bar(classes + w/2, pred_pct*100, width=w, label="Unseen Pred %")
-    ax1.set_xticks(classes)
-    ax1.set_xlabel("Class")
-    ax1.set_ylabel("Percent")
-    ax1.set_title(f"{target} — Train vs Unseen Predicted Distribution")
-    ax1.legend()
+    warn = (
+        (0.80 <= top_class_pct < 0.90) or
+        (0.25 <= drift_l1 < 0.35) or
+        (len(spiked) > 0)
+    )
 
-    ax2 = plt.subplot(3, 1, 2)
-    ax2.bar(classes, delta*100)
-    ax2.set_xticks(classes)
-    ax2.set_xlabel("Class")
-    ax2.set_ylabel("Delta (pp)")
-    ax2.set_title("Unseen Pred % minus Train % (percentage points)")
+    if hard_fail:
+        decision = "NO-GO"
+    elif warn:
+        decision = "REVIEW"
+    else:
+        decision = "GO"
 
-    ax3 = plt.subplot(3, 1, 3)
-    ax3.axis("off")
-    lines = [
-        f"Drift L1: {checks['drift_l1']:.3f} (warn={checks['drift_l1_warn']})",
-        f"Rare classes by train (<=2%): {checks['rare_classes_by_train']}",
-        f"Rare collapsed: {checks['rare_collapsed']} (warn={checks['rare_collapsed_warn']})",
-        f"Rare spiked: {checks['rare_spiked']} (warn={checks['rare_spiked_warn']})",
-        f"Top class: {checks['top_class']} at {checks['top_class_pct']*100:.1f}% (dominates warn={checks['top_class_dominates_warn']})",
-    ]
-    ax3.text(0.01, 0.95, "\n".join(lines), va="top", ha="left")
+    return decision, collapsed, spiked
 
+
+def add_exec_summary_page(pdf, results_df, meta: dict):
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(8.27, 11.69))
+    ax = plt.subplot(1, 1, 1)
+    ax.axis("off")
+
+    # counts
+    counts = results_df["decision"].value_counts().to_dict()
+    go = counts.get("GO", 0)
+    review = counts.get("REVIEW", 0)
+    nogo = counts.get("NO-GO", 0)
+
+    worst_drift = results_df.sort_values("drift_l1", ascending=False).head(10)
+    worst_dom = results_df.sort_values("top_class_pct", ascending=False).head(10)
+
+    lines = []
+    lines.append("MODEL GOVERNANCE SUMMARY (Unseen Prediction Run)")
+    lines.append("")
+    for k, v in meta.items():
+        lines.append(f"{k}: {v}")
+    lines.append("")
+    lines.append(f"Targets: {len(results_df)}")
+    lines.append(f"GO: {go}   |   REVIEW: {review}   |   NO-GO: {nogo}")
+    lines.append("")
+    lines.append("Top 10 by distribution drift (L1):")
+    for _, r in worst_drift.iterrows():
+        lines.append(f"  - {r['target']}: drift={r['drift_l1']:.3f}, top={r['top_class']}@{r['top_class_pct']*100:.1f}%, decision={r['decision']}")
+    lines.append("")
+    lines.append("Top 10 by dominance:")
+    for _, r in worst_dom.iterrows():
+        lines.append(f"  - {r['target']}: top={r['top_class']}@{r['top_class_pct']*100:.1f}%, drift={r['drift_l1']:.3f}, decision={r['decision']}")
+
+    ax.text(0.02, 0.98, "\n".join(lines), va="top", ha="left", fontsize=10)
     plt.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)
-
-
-def main():
-    # -------------------------
-    # Load Stage-0 features
-    # -------------------------
-    stage0 = joblib.load(STAGE0_PATH)
-    feature_cols = stage0["selected_features"]
-
-    # -------------------------
-    # Load unseen data
-    # -------------------------
-    df = pd.read_csv(UNSEEN_CSV)
-
-    # Ensure all required feature columns exist
-    for c in feature_cols:
-        if c not in df.columns:
-            df[c] = 0.0
-
-    # Fix feature dtypes for those columns
-    df, feature_cols, dtype_report = fix_feature_dtypes(df, feature_cols)
-    assert_numeric_features(df, feature_cols)
-
-    with open(DTYPE_REPORT_PATH, "w") as f:
-        json.dump(dtype_report, f, indent=2)
-
-    X = df[feature_cols]
-
-    # -------------------------
-    # Predict + export
-    # -------------------------
-    checks_rows = []
-
-    with PdfPages(COMBINED_PDF) as pdf:
-        for tgt in TARGETS:
-            artifact_path = os.path.join(MODEL_DIR, f"{tgt}_coral_artifact.joblib")
-            art = joblib.load(artifact_path)
-
-            boosters = art["model_boosters"]
-            K = int(art["n_classes"])
-            thr = float(art["decode_threshold"])
-            train_pct = np.array(art["train_distribution_pct"], dtype=float)
-
-            # proba_gt: (n_samples, K-1)
-            proba_gt = np.vstack(
-                [b.predict(X, num_iteration=b.best_iteration) for b in boosters]
-            ).T
-
-            y_pred = decode_coral(proba_gt, thr)
-            pred_pct = dist_pct(y_pred, K)
-            checks = sanity_checks(train_pct, pred_pct)
-
-            # per-target prediction CSV
-            pred_df = pd.DataFrame({f"{tgt}_pred": y_pred})
-            if ID_COL and ID_COL in df.columns:
-                pred_df.insert(0, ID_COL, df[ID_COL].values)
-            pred_df.to_csv(os.path.join(OUT_DIR, f"{tgt}_unseen_predictions.csv"), index=False)
-
-            # per-target distribution CSV
-            dist_df = pd.DataFrame({
-                "class": np.arange(K),
-                "train_pct": train_pct,
-                "unseen_pred_pct": pred_pct,
-                "delta_pct": pred_pct - train_pct,
-            })
-            dist_df.to_csv(os.path.join(OUT_DIR, f"{tgt}_distribution_compare.csv"), index=False)
-
-            # add page to combined PDF
-            add_page(pdf, tgt, train_pct, pred_pct, checks)
-
-            checks_rows.append({
-                "target": tgt,
-                "decode_threshold": thr,
-                "drift_l1": checks["drift_l1"],
-                "drift_l1_warn": checks["drift_l1_warn"],
-                "rare_collapsed_warn": checks["rare_collapsed_warn"],
-                "rare_spiked_warn": checks["rare_spiked_warn"],
-                "top_class": checks["top_class"],
-                "top_class_pct": checks["top_class_pct"],
-                "top_class_dominates_warn": checks["top_class_dominates_warn"],
-            })
-
-    pd.DataFrame(checks_rows).to_csv(os.path.join(OUT_DIR, "combined_sanity_checks.csv"), index=False)
-    print("Saved combined PDF:", COMBINED_PDF)
-    print("Saved outputs in:", OUT_DIR)
-
-
-if __name__ == "__main__":
-    main()
