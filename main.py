@@ -682,10 +682,48 @@ def pca_gate_build_clean_features(
     train_df_raw: pd.DataFrame,
     targets: List[str],
 ) -> Dict[str, object]:
+    """
+    PCA Gate (fit on train only) + feature auto-drop with safety checks.
+
+    FIXES the common loadings mismatch:
+      - Always aligns train_X/unseen_X to feature_cols
+      - Then re-locks feature_cols to train_X.columns actually used for PCA
+        so pca.components_.T rows == len(feature_cols)
+
+    Outputs in pca_out_dir:
+      - feature_cols_cleaned.json
+      - pca_gate_report.json
+      - dropped_features_final.csv
+      - drop_candidates_before_safety.csv
+      - pca_top_loadings.csv
+      - pca_loadings_matrix.csv
+      - explained_variance.csv/.png
+      - train_pc1_pc2_missingness.png
+      - drift_train_vs_unseen_pc1_pc2.png (if unseen exists)
+      - drift_summary_top_pcs.csv (if unseen exists)
+      - safety_check_top_features_per_target.json (if enabled)
+      - feature_support_counts.csv
+      - feature_weighted_support.csv
+    """
     pca_out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- basic stats on train
+    # -------------------------------------------------
+    # 0) Align matrices and LOCK feature_cols to reality
+    # -------------------------------------------------
+    # Ensure we really use the exact same columns as feature_cols
+    train_X = align_features(train_X, feature_cols)
+    if unseen_X is not None:
+        unseen_X = align_features(unseen_X, feature_cols)
+
+    # Lock feature_cols to the actual columns that will go into PCA
+    # (prevents shape mismatch errors)
+    feature_cols_used = list(train_X.columns)
+
+    # -------------------------------------------------
+    # 1) Basic stats on TRAIN
+    # -------------------------------------------------
     X_train_num = coerce_numeric(train_X)
+
     feat_missing = X_train_num.isna().mean()
     feat_var = X_train_num.var(axis=0, skipna=True).fillna(0.0)
 
@@ -699,17 +737,20 @@ def pca_gate_build_clean_features(
         q = float(np.quantile(feat_var.values, DROP_LOW_VAR_QUANTILE))
         low_var = set(feat_var[feat_var <= q].index.tolist())
 
-    # ---- fit PCA on train
+    # -------------------------------------------------
+    # 2) PCA fit on TRAIN only
+    # -------------------------------------------------
     imputer = SimpleImputer(strategy="median")
     scaler = StandardScaler(with_mean=True, with_std=True)
 
-    X_imp = imputer.fit_transform(X_train_num.values)
+    X_imp = imputer.fit_transform(X_train_num.values)     # shape (n, p)
     X_scaled = scaler.fit_transform(X_imp)
 
     n_comp = min(PCA_N_COMPONENTS, X_scaled.shape[1], X_scaled.shape[0])
     pca = PCA(n_components=n_comp, random_state=42)
     Z_train = pca.fit_transform(X_scaled)
 
+    # Explained variance
     evr = pca.explained_variance_ratio_
     cum = np.cumsum(evr)
     pd.DataFrame({"pc": np.arange(1, len(evr) + 1), "evr": evr, "cum_evr": cum}).to_csv(
@@ -725,13 +766,15 @@ def pca_gate_build_clean_features(
     plt.savefig(pca_out_dir / "explained_variance.png", dpi=160)
     plt.close()
 
+    # Loadings (SAFE: index length always matches pca.components_.T rows)
     loadings = pd.DataFrame(
         pca.components_.T,
-        index=feature_cols,
+        index=feature_cols_used,
         columns=[f"PC{i+1}" for i in range(pca.n_components_)],
     )
     loadings.to_csv(pca_out_dir / "pca_loadings_matrix.csv")
 
+    # Top loadings per PC
     rows = []
     for pc in loadings.columns:
         top_pos = loadings[pc].nlargest(PCA_TOP_K_LOADINGS)
@@ -742,12 +785,13 @@ def pca_gate_build_clean_features(
             rows.append({"pc": pc, "sign": "-", "feature": f, "loading": float(v)})
     pd.DataFrame(rows).to_csv(pca_out_dir / "pca_top_loadings.csv", index=False)
 
+    # Dominant features: appear in top-3 abs loadings across many PCs
     abs_load = loadings.abs()
     top3_mask = (abs_load.rank(axis=0, ascending=False) <= 3)
     dominant_count = top3_mask.sum(axis=1)
     dominant = set(dominant_count[dominant_count >= DROP_DOMINANT_PC_COUNT].index.tolist())
 
-    # missingness scatter
+    # Train missingness scatter
     row_missing = train_X.isna().mean(axis=1).values
     plt.figure()
     sc = plt.scatter(Z_train[:, 0], Z_train[:, 1], c=row_missing, s=10, alpha=0.85)
@@ -759,10 +803,13 @@ def pca_gate_build_clean_features(
     plt.savefig(pca_out_dir / "train_pc1_pc2_missingness.png", dpi=160)
     plt.close()
 
-    # drift plot
+    # -------------------------------------------------
+    # 3) Drift plot: Train vs Unseen (PCA fit on train)
+    # -------------------------------------------------
     drift = {}
     if unseen_X is not None and len(unseen_X) > 0:
         X_unseen_num = coerce_numeric(unseen_X)
+
         Xu_imp = imputer.transform(X_unseen_num.values)
         Xu_scaled = scaler.transform(Xu_imp)
         Z_unseen = pca.transform(Xu_scaled)
@@ -784,6 +831,7 @@ def pca_gate_build_clean_features(
         sd_tr = Z_train[:, :n_drift_pcs].std(axis=0, ddof=0)
         sd_tr = np.where(sd_tr == 0, 1.0, sd_tr)
         z_mean_shift = (mu_un - mu_tr) / sd_tr
+
         pd.DataFrame({
             "pc": np.arange(1, n_drift_pcs + 1),
             "mean_train": mu_tr,
@@ -794,11 +842,19 @@ def pca_gate_build_clean_features(
 
         drift = {"top_pcs": int(n_drift_pcs), "mean_shift_l2": float(np.linalg.norm(z_mean_shift))}
 
-    # ---- candidates before safety
+    # -------------------------------------------------
+    # 4) Candidate drops (before safety checks)
+    # -------------------------------------------------
     candidates = (high_missing | dominant | low_var) - set(PCA_ALWAYS_KEEP)
 
-    # ---- safety protections
-    safety = safety_check_protect_features(train_df=train_df_raw, feature_cols=feature_cols, targets=targets)
+    # -------------------------------------------------
+    # 5) Safety check protections (importance + support rules)
+    # -------------------------------------------------
+    safety = safety_check_protect_features(
+        train_df=train_df_raw,
+        feature_cols=feature_cols_used,   # IMPORTANT: match PCA features
+        targets=targets,
+    )
     protected_by_importance = set(safety.get("protected_features", set()))
     per_target_top = safety.get("per_target_top", {})
     used_targets = safety.get("used_targets", [])
@@ -807,7 +863,7 @@ def pca_gate_build_clean_features(
         with open(pca_out_dir / "safety_check_top_features_per_target.json", "w", encoding="utf-8") as f:
             json.dump(per_target_top, f, indent=2)
 
-    # support counts
+    # Count support across targets
     support_counts: Dict[str, int] = {}
     for _t, feats in per_target_top.items():
         for f in feats:
@@ -825,15 +881,18 @@ def pca_gate_build_clean_features(
     if SAFETY_CHECK_ENABLED and SAFETY_MIN_TARGET_SUPPORT and SAFETY_MIN_TARGET_SUPPORT > 0:
         globally_supported_by_count = {f for f, c in support_counts.items() if c >= SAFETY_MIN_TARGET_SUPPORT}
 
-    # weighted support
+    # Weighted support: score += (TOP_N - rank)
     weighted_support: Dict[str, float] = {}
     globally_supported_weighted = set()
     if SAFETY_CHECK_ENABLED and SAFETY_WEIGHTED_SUPPORT_ENABLED and SAFETY_WEIGHTED_SUPPORT_THRESHOLD > 0:
         for _t, feats in per_target_top.items():
             for rank, f in enumerate(feats):
-                add = max(SAFETY_TOP_N - rank, 0)
+                add = max(SAFETY_TOP_N - rank, 0)  # rank 0 => +TOP_N, last => +1
                 weighted_support[f] = weighted_support.get(f, 0.0) + float(add)
-        globally_supported_weighted = {f for f, s in weighted_support.items() if s >= SAFETY_WEIGHTED_SUPPORT_THRESHOLD}
+
+        globally_supported_weighted = {
+            f for f, s in weighted_support.items() if s >= float(SAFETY_WEIGHTED_SUPPORT_THRESHOLD)
+        }
 
     weighted_path = pca_out_dir / "feature_weighted_support.csv"
     if weighted_support:
@@ -843,14 +902,23 @@ def pca_gate_build_clean_features(
     else:
         pd.Series(dtype=float).to_csv(weighted_path, header=["weighted_support_score"])
 
-    # final never-drop set
-    never_drop = set(PCA_ALWAYS_KEEP) | protected_by_importance | globally_supported_by_count | globally_supported_weighted
+    # Final never-drop set
+    never_drop = (
+        set(PCA_ALWAYS_KEEP)
+        | protected_by_importance
+        | globally_supported_by_count
+        | globally_supported_weighted
+    )
 
+    # Final drop after protections
     final_drop = set(candidates) - never_drop
-    cleaned_feature_cols = [c for c in feature_cols if c not in final_drop]
+    cleaned_feature_cols = [c for c in feature_cols_used if c not in final_drop]
 
-    # write lists
-    with open(pca_out_dir / "feature_cols_cleaned.json", "w", encoding="utf-8") as f:
+    # -------------------------------------------------
+    # 6) Write outputs
+    # -------------------------------------------------
+    cleaned_path = pca_out_dir / "feature_cols_cleaned.json"
+    with open(cleaned_path, "w", encoding="utf-8") as f:
         json.dump(cleaned_feature_cols, f, indent=2)
 
     pd.Series(sorted(list(candidates))).to_csv(
@@ -861,7 +929,7 @@ def pca_gate_build_clean_features(
     )
 
     report = {
-        "n_features_in": int(len(feature_cols)),
+        "n_features_in": int(len(feature_cols_used)),
         "n_features_cleaned": int(len(cleaned_feature_cols)),
         "drop_candidates_count": int(len(candidates)),
         "dropped_count_final": int(len(final_drop)),
@@ -893,16 +961,18 @@ def pca_gate_build_clean_features(
         },
         "drift": drift,
         "paths": {
-            "feature_cols_cleaned": str(pca_out_dir / "feature_cols_cleaned.json"),
+            "feature_cols_cleaned": str(cleaned_path),
             "pca_dir": str(pca_out_dir),
             "feature_support_counts": str(support_counts_path),
             "feature_weighted_support": str(weighted_path),
         },
     }
+
     with open(pca_out_dir / "pca_gate_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
     return {"cleaned_feature_cols": cleaned_feature_cols, "final_drop": final_drop, "report": report}
+
 
 
 # ----------------------------
