@@ -983,9 +983,11 @@ class LGBMCoralModel:
         if best.get("tuning_skipped", False):
             _write_progress({"stage": "decode_only_tau_start", "target": target_name})
             if np.unique(y_va).size >= 2:
-                t0_tau = time.time()
                 cum_va = self._predict_cum_probs_with_models(X_va, self.models_)
-                tau_info = self._tune_tau_on_valid(y_valid=y_va, cum_probs_valid=cum_va)
+                tau_info = self._tune_tau_on_valid(
+                    y_valid=y_va,
+                    cum_probs_valid=cum_va,
+                )
                 best["tau"] = tau_info["tau"]
                 best["tau_score_qwk_valid"] = tau_info["tau_score_qwk"]
                 best["decode_only_tuned"] = True
