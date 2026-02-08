@@ -5,115 +5,186 @@ Stage 3: feature pruning decision
 Stage 4: FINAL per-target CORAL training
 Stage 5: predict on full_df
 
-# config.py
+# ============================================================
+# Core inputs / outputs
+# ============================================================
 
-# ---------------------------
-# Core inputs/outputs
-# ---------------------------
 TRAIN_CSV = "training_data.csv"
-UNSEEN_CSV = "unseen_data.csv"   # set None if no unseen
+UNSEEN_CSV = "unseen_data.csv"   # set None if no unseen data
 
-# If TARGETS is None, script auto-detects columns starting with TARGET_PREFIX ("y_")
+# If TARGETS is None, auto-detect columns starting with TARGET_PREFIX
 TARGETS = None
 TARGET_PREFIX = "y_"
 
-# If ID_COL is None, script will auto-detect first column starting with ID_PREFIX ("id_")
+# If ID_COL is None, auto-detect first column starting with ID_PREFIX
 ID_COL = None
 ID_PREFIX = "id_"
 
+# Feature columns auto-detected by prefix
 FEATURE_PREFIX = "ft_"
 
 ARTIFACTS_DIR = "artifacts"
 MODELS_DIR = f"{ARTIFACTS_DIR}/coral_models"
 OUT_DIR = f"{ARTIFACTS_DIR}/final_predictions"
 
-LOG_DIR = "artifacts/logs"
-LOG_LEVEL = "INFO"
-PROGRESS_JSON = "artifacts/logs/progress_coral.json"
 
-# Parallel threshold fitting (fits K-1 models)
-THRESH_FIT_N_JOBS = 1     # set 2-8 to parallelize thresholds
-LGBM_N_JOBS = -1          # threads per LightGBM fit; if THRESH_FIT_N_JOBS>1 set this to 1
+# ============================================================
+# Logging & observability
+# ============================================================
+
+log_dir = "artifacts/logs"
+log_level = "INFO"
+
+# Live progress snapshot (overwritten frequently)
+progress_json = "artifacts/logs/progress_coral.json"
 
 
-# Optional: if you have a stage-0 selected feature artifact
+# ============================================================
+# Feature selection (Stage-0 / optional)
+# ============================================================
+
+# Optional: joblib artifact from Stage-0
 STAGE0_PATH = f"{ARTIFACTS_DIR}/stage0_features.joblib"
 
-# Optional: explicit feature list overrides everything
+# Optional: explicit override (disables auto-detection + Stage-0)
 # FEATURE_COLS = ["ft_a", "ft_b", ...]
 
-# ---------------------------
+
+# ============================================================
 # Training guards
-# ---------------------------
+# ============================================================
+
+# Minimum labeled rows required to train a target
 MIN_ROWS_PER_TARGET = 80
 
-# Decode threshold candidates (tau grid)
+# Minimum rows per CV fold (used in tuning guard)
+min_rows_per_fold = 200
+
+# CV folds for tuning
+cv_folds = 5
+
+random_state = 42
+
+
+# ============================================================
+# CORAL decode / ordinal settings
+# ============================================================
+
+# Tau grid for decode-only tuning and weight tuning
 DECODE_GRID = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
 
-# ---------------------------
-# Tuning & parallelism
-# ---------------------------
+
+# ============================================================
+# LightGBM base model hyperparameters
+# ============================================================
+
+n_estimators = 600
+learning_rate = 0.05
+num_leaves = 63
+min_child_samples = 50
+subsample = 0.8
+colsample_bytree = 0.8
+reg_lambda = 1.0
+
+# Early stopping
+early_stopping_rounds = 50
+eval_metric = "binary_logloss"
+
+
+# ============================================================
+# Parallelism & performance control
+# ============================================================
 
 # Parallel grid evaluation in tune_weights()
 tuning_n_jobs = 4          # outer parallelism (alpha × pos_mult × tau)
 
-# Parallel threshold fits inside each CV fold (keep 1 unless K is large)
+# Parallel threshold fits inside each CV fold
+# (keep =1 unless num_classes is large)
 cv_thresh_fit_n_jobs = 1
 
 # LightGBM threads per fit
 # IMPORTANT:
-# - If tuning_n_jobs > 1 or cv_thresh_fit_n_jobs > 1 → set this to 1
-# - If everything is serial → you may set -1
+# - If tuning_n_jobs > 1 OR cv_thresh_fit_n_jobs > 1 → set to 1
+# - If everything is serial → you may set to -1
 lgbm_n_jobs = 1
 
-# ---------------------------
-# Resume / checkpointing
-# ---------------------------
-RESUME_TUNING = True
-TUNING_STATE_DIR = "artifacts/tuning_state"   # where resume files live
+
+# ============================================================
+# Resume / checkpointing (Posit-safe)
+# ============================================================
+
+resume_tuning = True
+tuning_state_dir = "artifacts/tuning_state"
 
 
-# ---------------------------
-# PCA Gate settings
-# ---------------------------
+# ============================================================
+# PCA Gate (feature pruning)
+# ============================================================
+
 PCA_GATE_DIR = f"{ARTIFACTS_DIR}/pca_gate"
+
 PCA_N_COMPONENTS = 20
 PCA_TOP_K_LOADINGS = 15
 PCA_PLOT_MAX = 50
 
 # Auto-drop rules
-PCA_DROP_MISSING_FRAC = 0.80
-PCA_DROP_DOMINANT_PC_COUNT = 3
-PCA_DROP_LOW_VAR_QUANTILE = 0.00
+PCA_DROP_MISSING_FRAC = 0.80       # drop if >=80% missing
+PCA_DROP_DOMINANT_PC_COUNT = 3     # appears in top loadings across >=3 PCs
+PCA_DROP_LOW_VAR_QUANTILE = 0.00   # 0 disables (set 0.01 for bottom 1%)
 
-# Never drop these (optional)
+# Always keep (manual override)
 PCA_ALWAYS_KEEP = []
 
-# ---------------------------
-# Feature drop safety check (baseline LightGBM importances)
-# ---------------------------
+
+# ============================================================
+# PCA feature safety check (baseline LightGBM importances)
+# ============================================================
+
 PCA_SAFETY_CHECK_ENABLED = True
+
+# Top-N important features protected per target
 PCA_SAFETY_TOP_N = 50
 
-# With 200+ targets, increase coverage + thresholds
+# How many targets to sample for safety check (for speed)
 PCA_SAFETY_MAX_TARGETS = 50
+
+# Only use targets with >= this many labeled rows
 PCA_SAFETY_MIN_ROWS = 300
+
+# Subsample rows per target for safety model
 PCA_SAFETY_SAMPLE_ROWS = 8000
+
+# Baseline LightGBM size for safety check
 PCA_SAFETY_N_ESTIMATORS = 400
 PCA_SAFETY_RANDOM_STATE = 42
 
-# Never drop features that appear in >= X targets' top-N importance lists
+
+# ============================================================
+# Global feature protection rules (multi-target)
+# ============================================================
+
+# Never drop features appearing in >= X targets' top-N lists
 PCA_SAFETY_MIN_TARGET_SUPPORT = 10
 
-# Weighted support rule
+# Weighted support rule (rank-aware)
 PCA_SAFETY_WEIGHTED_SUPPORT_ENABLED = True
+
+# Example intuition:
+# rank 0 in 8 targets → 8 * 50 = 400
+# rank 10 in 10 targets → 10 * 40 = 400
 PCA_SAFETY_WEIGHTED_SUPPORT_THRESHOLD = 400
 
-# ---------------------------
+
+# ============================================================
 # Prediction output controls
-# ---------------------------
+# ============================================================
+
+# WARNING: probability columns make CSVs very wide
 OUTPUT_PROB_COLUMNS = True
+
+# Cap number of probability columns per target
 MAX_PROB_CLASSES = 10
+
 
 
 
