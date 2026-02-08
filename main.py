@@ -1057,6 +1057,16 @@ import matplotlib.pyplot as plt
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from collections import Counter
+from sklearn.metrics import (
+    mean_absolute_error,
+    confusion_matrix,
+    recall_score,
+    classification_report
+)
+import matplotlib.pyplot as plt
+import json
+
 
 from lightgbm import LGBMClassifier
 
@@ -1188,6 +1198,62 @@ def get_feature_cols(df: pd.DataFrame, targets: List[str], id_col: Optional[str]
 
     # Fallback: exclude targets and id
     return [c for c in df.columns if c not in targets and c != id_col]
+
+# ============================================================
+# Class weights
+# ============================================================
+
+def compute_class_weights(y):
+    counts = Counter(y)
+    total = sum(counts.values())
+
+    weights = {
+        cls: total / (len(counts) * count)
+        for cls, count in counts.items()
+    }
+
+    return weights
+
+
+def adjust_extreme_weights(weights, boost=1.5):
+    min_cls = min(weights.keys())
+    max_cls = max(weights.keys())
+
+    weights[min_cls] *= boost
+    weights[max_cls] *= boost
+
+    return weights
+
+
+# ============================================================
+# Decode
+# ============================================================
+
+def decode_with_thresholds(cum_probas, thresholds):
+    preds = []
+
+    for row in cum_probas:
+        cls = sum(row >= thresholds)
+        preds.append(cls)
+
+    return np.array(preds)
+
+
+def tune_decode_thresholds(y_true, cum_probas, grid):
+    best_mae = np.inf
+    best_t = None
+
+    for t in grid:
+        thresholds = np.array([t] * cum_probas.shape[1])
+        y_pred = decode_with_thresholds(cum_probas, thresholds)
+
+        mae = mean_absolute_error(y_true, y_pred)
+
+        if mae < best_mae:
+            best_mae = mae
+            best_t = thresholds
+
+    return best_t, best_mae
 
 
 # ----------------------------
@@ -1596,6 +1662,61 @@ def pca_gate_build_clean_features(
 
     return {"cleaned_feature_cols": cleaned_feature_cols, "final_drop": final_drop, "report": report}
 
+# ============================================================
+# Class weights
+# ============================================================
+
+def compute_class_weights(y):
+    counts = Counter(y)
+    total = sum(counts.values())
+
+    weights = {
+        cls: total / (len(counts) * count)
+        for cls, count in counts.items()
+    }
+
+    return weights
+
+
+def adjust_extreme_weights(weights, boost=1.5):
+    min_cls = min(weights.keys())
+    max_cls = max(weights.keys())
+
+    weights[min_cls] *= boost
+    weights[max_cls] *= boost
+
+    return weights
+
+
+# ============================================================
+# Decode tuning
+# ============================================================
+
+def decode_with_thresholds(cum_probas, thresholds):
+    preds = []
+
+    for row in cum_probas:
+        cls = sum(row >= thresholds)
+        preds.append(cls)
+
+    return np.array(preds)
+
+
+def tune_decode_thresholds(y_true, cum_probas, grid):
+    best_mae = np.inf
+    best_t = None
+
+    for t in grid:
+        thresholds = np.array([t] * cum_probas.shape[1])
+        y_pred = decode_with_thresholds(cum_probas, thresholds)
+
+        mae = mean_absolute_error(y_true, y_pred)
+
+        if mae < best_mae:
+            best_mae = mae
+            best_t = thresholds
+
+    return best_t, best_mae
 
 
 # ----------------------------
@@ -1650,77 +1771,205 @@ def main():
 
     summary_rows = []
 
-    # loop each target
-    for t in targets:
-        if t not in train_df.columns:
-            continue
+    # ============================================================
+# TRAIN + PREDICT LOOP
+# ============================================================
 
-        mask = train_df[t].notna()
-        n_rows = int(mask.sum())
-        if n_rows < MIN_ROWS_PER_TARGET:
-            summary_rows.append({"target": t, "status": "skip_too_few_rows", "n_rows": n_rows})
-            continue
+for t in targets:
 
-        X_train_t = align_features(train_df.loc[mask], feature_cols_cleaned)
-        y_train_t = train_df.loc[mask, t].copy()
+    if t not in train_df.columns:
+        continue
 
-        y_code, label_meta = make_ordinal_codes(y_train_t)
-        K = int(label_meta["n_classes"])
-        if K < 2:
-            summary_rows.append({"target": t, "status": "skip_single_class", "n_rows": n_rows, "n_classes": K})
-            continue
+    print(f"\n🔹 Training target: {t}")
 
-        try:
-            model = LGBMCoralModel(num_classes=K, config=coral_cfg, decode_grid=decode_grid)
-            model.fit(X_train_t, y_code, tune_weights=True)
-        except Exception as e:
-            summary_rows.append({"target": t, "status": "error_fit", "n_rows": n_rows, "n_classes": K, "error": repr(e)})
-            continue
+    mask = train_df[t].notna()
+    n_rows = int(mask.sum())
 
-        pred_code = model.predict(X_full)
-        pred_label = decode_to_original_labels(pred_code, label_meta["from_code"])
-
-        out_df[f"{t}_pred"] = pred_label
-        out_df[f"{t}_pred_code"] = pred_code
-        out_df[f"{t}_tau_used"] = float(model.best_params_.get("tau", 0.5))
-
-        if OUTPUT_PROB_COLUMNS and K <= MAX_PROB_CLASSES:
-            cum = model.predict_cumproba(X_full)
-            proba = model.predict_proba(X_full)
-            for k in range(1, K):
-                out_df[f"{t}_p_ge_{k}"] = cum[:, k - 1].astype(float)
-            for k in range(K):
-                out_df[f"{t}_p_class_{k}"] = proba[:, k].astype(float)
-
-        model_path = Path(MODELS_DIR) / f"{t}_coral.joblib"
-        meta_path = Path(MODELS_DIR) / f"{t}_meta.json"
-        joblib.dump(model, model_path)
-
-        meta_out = {
+    if n_rows < MIN_ROWS_PER_TARGET:
+        summary_rows.append({
             "target": t,
-            "n_rows": n_rows,
-            "n_features": int(X_train_t.shape[1]),
-            "label_meta": label_meta,
-            "best_params": model.best_params_,
-            "feature_cols_cleaned_path": str(Path(PCA_GATE_DIR) / "feature_cols_cleaned.json"),
-            "feature_cols_cleaned_count": len(feature_cols_cleaned),
-        }
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_out, f, indent=2, ensure_ascii=False)
+            "status": "skip_too_few_rows",
+            "n_rows": n_rows
+        })
+        continue
 
-        if id_col and id_col in train_df.columns:
-            train_df.loc[mask, [id_col, t]].to_csv(Path(MODELS_DIR) / f"{t}_train_rows.csv", index=False)
+    # --------------------------------------------------------
+    # Prepare data
+    # --------------------------------------------------------
+
+    X_train_t = align_features(
+        train_df.loc[mask],
+        feature_cols_cleaned
+    )
+
+    y_train_t = train_df.loc[mask, t].copy()
+
+    y_code, label_meta = make_ordinal_codes(y_train_t)
+    K = int(label_meta["n_classes"])
+
+    if K < 2:
+        summary_rows.append({
+            "target": t,
+            "status": "skip_single_class",
+            "n_rows": n_rows,
+            "n_classes": K
+        })
+        continue
+
+    # --------------------------------------------------------
+    # Class weights
+    # --------------------------------------------------------
+
+    class_weights = compute_class_weights(y_code)
+    class_weights = adjust_extreme_weights(class_weights, boost=1.5)
+
+    sample_weights = pd.Series(y_code).map(class_weights).values
+
+    print("Class weights:", class_weights)
+
+    # --------------------------------------------------------
+    # Train CORAL model
+    # --------------------------------------------------------
+
+    try:
+
+        model = LGBMCoralModel(
+            num_classes=K,
+            config=coral_cfg,
+            decode_grid=decode_grid
+        )
+
+        model.fit(
+            X_train_t,
+            y_code,
+            sample_weight=sample_weights,
+            tune_weights=True
+        )
+
+    except Exception as e:
 
         summary_rows.append({
             "target": t,
-            "status": "trained_and_predicted",
+            "status": "error_fit",
             "n_rows": n_rows,
-            "n_classes": K,
-            "tau": float(model.best_params_.get("tau", 0.5)),
-            "tuning_skipped": bool(model.best_params_.get("tuning_skipped", False)),
-            "decode_only_tuned": bool(model.best_params_.get("decode_only_tuned", False)),
-            "prob_cols_written": bool(OUTPUT_PROB_COLUMNS and K <= MAX_PROB_CLASSES),
+            "error": repr(e)
         })
+
+        continue
+
+    # --------------------------------------------------------
+    # Validation predictions (for decode tuning + metrics)
+    # --------------------------------------------------------
+
+    cum_probas_train = model.predict_cumproba(X_train_t)
+
+    thresholds, best_mae = tune_decode_thresholds(
+        y_true=y_code,
+        cum_probas=cum_probas_train,
+        grid=decode_grid
+    )
+
+    print("Best thresholds:", thresholds)
+    print("Best MAE:", best_mae)
+
+    pred_code_train = decode_with_thresholds(
+        cum_probas_train,
+        thresholds
+    )
+
+    # --------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------
+
+    mae = mean_absolute_error(y_code, pred_code_train)
+
+    tail_recall = recall_score(
+        y_code,
+        pred_code_train,
+        labels=[0, K - 1],
+        average="macro"
+    )
+
+    print("Final MAE:", mae)
+    print("Tail recall:", tail_recall)
+
+    print(classification_report(y_code, pred_code_train))
+
+    # --------------------------------------------------------
+    # Confusion matrix outputs
+    # --------------------------------------------------------
+
+    cm = confusion_matrix(y_code, pred_code_train)
+
+    cm_df = pd.DataFrame(cm)
+
+    cm_df.to_csv(
+        Path(MODELS_DIR) / f"{t}_confusion_matrix.csv",
+        index=False
+    )
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cm, interpolation="nearest")
+    plt.title(f"{t} Confusion Matrix")
+    plt.colorbar()
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.tight_layout()
+
+    plt.savefig(
+        Path(MODELS_DIR) / f"{t}_confusion_matrix.png"
+    )
+
+    plt.close()
+
+    # --------------------------------------------------------
+    # Full dataset prediction
+    # --------------------------------------------------------
+
+    pred_code_full = model.predict(X_full)
+
+    pred_label_full = decode_to_original_labels(
+        pred_code_full,
+        label_meta["from_code"]
+    )
+
+    out_df[f"{t}_pred"] = pred_label_full
+    out_df[f"{t}_pred_code"] = pred_code_full
+
+    # --------------------------------------------------------
+    # Save artifact
+    # --------------------------------------------------------
+
+    artifact = {
+        "model": model,
+        "thresholds": thresholds,
+        "class_weights": class_weights,
+        "mae": float(mae),
+        "tail_recall": float(tail_recall),
+        "label_meta": label_meta
+    }
+
+    joblib.dump(
+        artifact,
+        Path(MODELS_DIR) / f"{t}_coral_artifact.joblib"
+    )
+
+    # --------------------------------------------------------
+    # Summary row
+    # --------------------------------------------------------
+
+    summary_rows.append({
+        "target": t,
+        "status": "trained_and_predicted",
+        "n_rows": n_rows,
+        "n_classes": K,
+        "mae": float(mae),
+        "tail_recall": float(tail_recall),
+        "prob_cols_written": bool(
+            OUTPUT_PROB_COLUMNS and K <= MAX_PROB_CLASSES
+        ),
+    })
+
 
     preds_path = Path(OUT_DIR) / "full_predictions.csv"
     out_df.to_csv(preds_path, index=False)
