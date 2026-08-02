@@ -1,19 +1,25 @@
 """
 AWS Bedrock Knowledge Base helper module.
 
-Two access paths:
-  - Verbatim  : retrieve_only()          -> raw Retrieve API, no generation, deterministic
-  - Reasoning : retrieve_and_generate()  -> Nova Pro grounded answer
-                *_with_citations()       -> answer + citations
-                stream_*()               -> token stream (reasoning path only)
+Two access paths, matching the two Letter Types in chat_kb.py:
+  - Access Letter   : retrieve_only()  -> raw Retrieve API, no generation, deterministic
+  - Planning Letter  : revise_text()   -> Nova Pro revises a pasted draft (Converse API,
+                                          no knowledge base retrieval involved)
 
 Config is read from the environment so nothing sensitive is hardcoded:
-  AWS_REGION                 (default: xxxx)
-  BEDROCK_KNOWLEDGE_BASE_ID  (default: xxxx)
+  AWS_REGION                 (default: ap-southeast-2)
+  BEDROCK_KNOWLEDGE_BASE_ID  (default: Y2JLDIEQKB)
   BEDROCK_INFERENCE_PROFILE  (default: apac.amazon.nova-pro-v1:0)
   AWS_ACCOUNT_ID             (optional; resolved via STS if absent)
 
 Credentials come from the attached IAM role / default provider chain.
+
+NOTE: A prior "reasoning path" (retrieve_and_generate / RAG-with-citations /
+streaming) was removed here because nothing in chat_kb.py called it — see
+project history if you want to reintroduce a grounded Q&A mode later. If you
+bring it back, restore the fidelity-focused GENERATION_PROMPT_TEMPLATE rules
+(only use retrieved facts, reproduce names/dates/figures exactly, say "not
+found" rather than guess) rather than writing a new prompt from scratch.
 """
 
 import os
@@ -24,38 +30,17 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-REGION = os.environ.get("AWS_REGION", "xxxx")
-KNOWLEDGE_BASE_ID = os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID", "xxxx")
+REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+KNOWLEDGE_BASE_ID = os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID", "Y2JLDIEQKB")
 
 # Nova Pro is NOT invokable on-demand via the bare foundation-model ARN outside
 # us-east-1. In ap-southeast-2 it must go through the APAC cross-region
-# inference profile, otherwise Retrieve & Generate raises a ValidationException.
+# inference profile, otherwise API calls raise a ValidationException.
 INFERENCE_PROFILE_ID = os.environ.get(
     "BEDROCK_INFERENCE_PROFILE", "apac.amazon.nova-pro-v1:0"
 )
 
 DEFAULT_TOP_K = 5
-
-# --- Reasoning-path generation prompt (Nova Pro needs explicit instructions) ---
-# The template MUST contain $search_results$. Keep $output_format_instructions$
-# or the model won't emit the citation markers that populate response["citations"].
-# The reviewer's question is NOT a placeholder; it arrives via input.text.
-GENERATION_PROMPT_TEMPLATE = """You are a knowledge assistant for an internal review team. Answer the reviewer's question using only the information in the search results below.
-
-Instructions:
-- Use only facts found in the search results. Do not add outside knowledge.
-- If the search results do not contain the answer, say you could not find it in the source material. Do not guess.
-- Reproduce names, dates, figures, defined terms, and section numbers exactly as they appear in the sources. Do not paraphrase these.
-- Be concise and objective. Do not speculate beyond the sources.
-
-Search results:
-$search_results$
-
-$output_format_instructions$"""
-
-GENERATION_TEMPERATURE = 0.0  # deterministic / faithful
-GENERATION_TOP_P = 1.0
-GENERATION_MAX_TOKENS = 2048
 
 # --- Planning Letter revision (Converse API, NO knowledge base retrieval) ---
 # The reviewer pastes a draft; Nova Pro revises it against this system prompt.
@@ -110,7 +95,7 @@ class BedrockKnowledgeBase:
             f":inference-profile/{INFERENCE_PROFILE_ID}"
         )
 
-    # ---- Verbatim path -----------------------------------------------------
+    # ---- Access Letter: deterministic verbatim path, zero generation ------
 
     def retrieve_only(
         self,
@@ -135,104 +120,6 @@ class BedrockKnowledgeBase:
             raise RuntimeError(f"Retrieval failed ({code})") from e
 
         return response.get("retrievalResults", [])
-
-    # ---- Reasoning path ----------------------------------------------------
-
-    def retrieve_and_generate(
-        self,
-        question: str,
-        prompt_template: str = GENERATION_PROMPT_TEMPLATE,
-    ) -> dict:
-        try:
-            return self.client.retrieve_and_generate(
-                input={"text": question},
-                retrieveAndGenerateConfiguration={
-                    "type": "KNOWLEDGE_BASE",
-                    "knowledgeBaseConfiguration": {
-                        "knowledgeBaseId": self.knowledge_base_id,
-                        "modelArn": self.model_arn,
-                        "retrievalConfiguration": {
-                            "vectorSearchConfiguration": {
-                                "numberOfResults": DEFAULT_TOP_K,
-                                "overrideSearchType": "HYBRID",
-                            }
-                        },
-                        "generationConfiguration": {
-                            "promptTemplate": {
-                                "textPromptTemplate": prompt_template,
-                            },
-                            "inferenceConfig": {
-                                "textInferenceConfig": {
-                                    "temperature": GENERATION_TEMPERATURE,
-                                    "topP": GENERATION_TOP_P,
-                                    "maxTokens": GENERATION_MAX_TOKENS,
-                                }
-                            },
-                        },
-                    },
-                },
-            )
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            logger.exception("retrieve_and_generate() failed")
-            raise RuntimeError(f"Retrieve & generate failed ({code})") from e
-
-    def retrieve_and_generate_with_citations(
-        self,
-        question: str,
-        prompt_template: str = GENERATION_PROMPT_TEMPLATE,
-    ) -> dict:
-        response = self.retrieve_and_generate(question, prompt_template)
-        return {
-            "answer": response.get("output", {}).get("text", ""),
-            "citations": response.get("citations", []),
-        }
-
-    def stream_retrieve_and_generate(
-        self,
-        question: str,
-        prompt_template: str = GENERATION_PROMPT_TEMPLATE,
-    ):
-        """Reasoning path only. Never use this for the verbatim path."""
-        try:
-            response = self.client.retrieve_and_generate_stream(
-                input={"text": question},
-                retrieveAndGenerateConfiguration={
-                    "type": "KNOWLEDGE_BASE",
-                    "knowledgeBaseConfiguration": {
-                        "knowledgeBaseId": self.knowledge_base_id,
-                        "modelArn": self.model_arn,
-                        "retrievalConfiguration": {
-                            "vectorSearchConfiguration": {
-                                "numberOfResults": DEFAULT_TOP_K,
-                                "overrideSearchType": "HYBRID",
-                            }
-                        },
-                        "generationConfiguration": {
-                            "promptTemplate": {
-                                "textPromptTemplate": prompt_template,
-                            },
-                            "inferenceConfig": {
-                                "textInferenceConfig": {
-                                    "temperature": GENERATION_TEMPERATURE,
-                                    "topP": GENERATION_TOP_P,
-                                    "maxTokens": GENERATION_MAX_TOKENS,
-                                }
-                            },
-                        },
-                    },
-                },
-            )
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            logger.exception("retrieve_and_generate_stream() failed")
-            raise RuntimeError(f"Streaming failed ({code})") from e
-
-        for event in response["stream"]:
-            if "output" in event:
-                text = event["output"].get("text", "")
-                if text:
-                    yield text
 
     # ---- Planning Letter revision (direct model call, no retrieval) --------
 
@@ -274,14 +161,6 @@ _kb = BedrockKnowledgeBase()
 
 def knowledge_base_search(question: str, top_k: int = DEFAULT_TOP_K) -> list:
     return _kb.retrieve_only(question, top_k=top_k)
-
-
-def knowledge_base_answer(question: str) -> dict:
-    return _kb.retrieve_and_generate(question)
-
-
-def knowledge_base_answer_with_citations(question: str) -> dict:
-    return _kb.retrieve_and_generate_with_citations(question)
 
 
 def revise_text(
