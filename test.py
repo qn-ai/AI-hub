@@ -1,26 +1,4 @@
 """
-AWS Bedrock Knowledge Base helper module.
-
-Two access paths, matching the two Letter Types in chat_kb.py:
-  - Access Letter   : retrieve_only()  -> raw Retrieve API, no generation, deterministic
-  - Planning Letter  : revise_text()   -> Nova Pro revises a pasted draft (Converse API,
-                                          no knowledge base retrieval involved)
-
-Config is read from the environment so nothing sensitive is hardcoded:
-  AWS_REGION                 (default: ap-southeast-2)
-  BEDROCK_KNOWLEDGE_BASE_ID  (default: Y2JLDIEQKB)
-  BEDROCK_INFERENCE_PROFILE  (default: apac.amazon.nova-pro-v1:0)
-  AWS_ACCOUNT_ID             (optional; resolved via STS if absent)
-
-Credentials come from the attached IAM role / default provider chain.
-
-NOTE: A prior "reasoning path" (retrieve_and_generate / RAG-with-citations /
-streaming) was removed here because nothing in chat_kb.py called it — see
-project history if you want to reintroduce a grounded Q&A mode later. If you
-bring it back, restore the fidelity-focused GENERATION_PROMPT_TEMPLATE rules
-(only use retrieved facts, reproduce names/dates/figures exactly, say "not
-found" rather than guess) rather than writing a new prompt from scratch.
-"""
 
 import os
 import logging
@@ -29,16 +7,6 @@ import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
-
-REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
-KNOWLEDGE_BASE_ID = os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID", "Y2JLDIEQKB")
-
-# Nova Pro is NOT invokable on-demand via the bare foundation-model ARN outside
-# us-east-1. In ap-southeast-2 it must go through the APAC cross-region
-# inference profile, otherwise API calls raise a ValidationException.
-INFERENCE_PROFILE_ID = os.environ.get(
-    "BEDROCK_INFERENCE_PROFILE", "apac.amazon.nova-pro-v1:0"
-)
 
 DEFAULT_TOP_K = 5
 
